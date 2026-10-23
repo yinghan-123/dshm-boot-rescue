@@ -57,14 +57,14 @@ dshm-boot-rescue/
 
 前置：DSHM 已安装并能正常进入界面。
 
-> 把下面的 `<owner>` 换成该仓库实际的 GitHub 用户/组织名。
+> 本仓库是 huangshou1/dshm-boot-rescue 的镜像，`lib/index.js` 已带本地安全加固（见 NOTICE.md）。
 
 ### 方式 A：设置里安装（推荐）
 
 1. 打开 DSHM → **设置 → 插件**；
 2. 在「安装插件」输入框里填：
    ```text
-   github:<owner>/dshm-boot-rescue
+   github:yinghan-123/dshm-boot-rescue
    ```
 3. 确认安装，等待完成（端侧安装要下载、解包、写 profile，通常需要几十秒）；
 4. **划掉后台重新打开应用**（从最近任务里划掉 DSHM，再重新打开）。
@@ -76,7 +76,7 @@ DSHM 端侧没有真正的 node/pnpm，`pnpm` 是宿主提供的假壳：它会�
 Host 进程内安装器，并同步返回结果。在 DSHM 的终端/Agent Shell 里执行：
 
 ```sh
-pnpm add github:<owner>/dshm-boot-rescue
+pnpm add github:yinghan-123/dshm-boot-rescue
 ```
 
 成功会打印 `ok:true` 的 JSON，失败会打印 `ok:false` 与原因。

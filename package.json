@@ -38,5 +38,13 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yinghan-123/dshm-boot-rescue.git"
+  },
+  "homepage": "https://github.com/yinghan-123/dshm-boot-rescue#readme",
+  "bugs": {
+    "url": "https://github.com/yinghan-123/dshm-boot-rescue/issues"
   }
 }
