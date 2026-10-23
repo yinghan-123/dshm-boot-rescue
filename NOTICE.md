@@ -14,7 +14,7 @@
 | `package.json` | `94432e66…` | 仅补 `repository` / `homepage` 字段 |
 | `cordis.patch.yml` | `5841af2b…` | 未改动 |
 | `lib/index.js` | `0d906b6b…` | **已加固**，见下 |
-| `lib/rescue-client.js` | `4dfbbb0e…` | 未改动 |
+| `lib/rescue-client.js` | `4dfbbb0e…` | **已新增弹窗提示**（见下） |
 | `test/rescue.test.mjs` | `9f14458f…` | 未改动 |
 | `tools/check.mjs` | `e6bd5ee6…` | 未改动 |
 
@@ -59,3 +59,15 @@
 本副本的加固改动与上游作者无关，不代表上游认可。上游 README 声明 MIT，
 但上游仓库当时没有 `LICENSE` 文件；本目录补的 `LICENSE` 保留原始版权人
 （`dshm-boot-rescue contributors`），本副本的修改同样以 MIT 发布。
+
+### 本地新增功能：救援脚本弹窗提示（2026-10-23）
+
+`lib/rescue-client.js` 增加自绘弹窗组件与五类提示：失败页就绪提示、降级模式红色警示、
+正常启动时的「启动救援已就绪」状态提示、正常界面的「救援停用项」提醒、
+以及停用/恢复成功与失败的结果提示。
+实现约束与原脚本一致：ES5 语法、零依赖、不写浏览器存储、不新增外部请求、不自动重载页面。
+
+同步更新 `test/rescue.test.mjs` 中受影响的浏览器行为断言（健康界面巡检、失败页面板 +
+弹窗、幂等），并新增 2 个弹窗用例（正常界面救援停用项、降级模式）。
+`package.json` 版本从 1.0.0 提升到 1.1.0；宿主半身 `lib/index.js` 未改动，
+「回环校验严格化」加固补丁原样保留。

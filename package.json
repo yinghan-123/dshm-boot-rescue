@@ -1,6 +1,6 @@
 {
   "name": "dshm-boot-rescue",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "DSHM (HarmonyOS DeepSeek Harness) 启动救援：插件加载失败页里注入恢复中心，停用肇事插件后重启应用即可恢复。",
   "private": false,
   "type": "module",

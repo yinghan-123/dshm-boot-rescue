@@ -1440,8 +1440,15 @@ test("rescue client never mounts on a healthy UI that merely quotes failure text
   vm.runInNewContext(clientText, run.sandbox, { filename: "rescue-client.js" });
   await flushClientWork();
 
-  assert.equal(run.fetchCalls.length, 0);
-  assert.equal(run.body.children.length, 0);
+  // 健康界面会做一次只读巡检：不挂救援面板，但会弹「启动救援已就绪」提示。
+  assert.equal(run.fetchCalls.length, 1);
+  assert.equal(run.fetchCalls[0].url, "/dshm-boot-rescue/state");
+  assert.equal(run.body.children.length, 1);
+  const readyDialog = run.body.children[0];
+  assert.match(readyDialog.className, /dbr-dialog/);
+  assert.match(readyDialog.innerHTML, /启动救援已就绪/);
+  assert.match(readyDialog.innerHTML, /DSHM 已正常启动/);
+  assert.doesNotMatch(readyDialog.innerHTML, /dbr-overlay/);
 });
 
 test("rescue client mounts the panel on the real failure page and auto-selects suspects", async function () {
@@ -1457,7 +1464,7 @@ test("rescue client mounts the panel on the real failure page and auto-selects s
   assert.equal(run.fetchCalls.length, 1);
   assert.equal(run.fetchCalls[0].url, "/dshm-boot-rescue/state");
   assert.deepEqual(run.fetchCalls[0].init, { credentials: "same-origin" });
-  assert.equal(run.body.children.length, 1);
+  assert.equal(run.body.children.length, 2, "rescue panel plus the failure-ready popup");
 
   const overlay = run.body.children[0];
   assert.match(overlay.className, /dbr-overlay/);
@@ -1474,6 +1481,12 @@ test("rescue client mounts the panel on the real failure page and auto-selects s
   const summary = overlay._nodes['[data-role="summary"]'];
   assert.match(summary.textContent, /显示 1 项/);
   assert.match(summary.textContent, /可操作 1 项/);
+
+  // 失败页先弹「已就绪」提示，再露出下面的救援面板。
+  const dialog = run.body.children[1];
+  assert.match(dialog.className, /dbr-dialog/);
+  assert.match(dialog.innerHTML, /检测到插件加载失败/);
+  assert.match(dialog.innerHTML, /打开恢复中心/);
 });
 
 test("rescue client recognizes the core '<name>: import failed' hint", async function () {
@@ -1487,7 +1500,7 @@ test("rescue client recognizes the core '<name>: import failed' hint", async fun
   await flushClientWork();
 
   assert.equal(run.fetchCalls.length, 1);
-  assert.equal(run.body.children.length, 1);
+  assert.equal(run.body.children.length, 2);
   const overlay = run.body.children[0];
   const list = overlay._nodes['[data-role="list"]'];
   assert.match(list.innerHTML, /data-id="dsh-market"/);
@@ -1508,11 +1521,12 @@ test("rescue client shows the read-only self-check notice on the preview page", 
   await flushClientWork();
 
   assert.equal(run.fetchCalls.length, 1);
-  assert.equal(run.body.children.length, 1);
+  assert.equal(run.body.children.length, 2);
   const overlay = run.body.children[0];
   const status = overlay._nodes['[data-role="status"]'];
   assert.equal(status.textContent, "只读自检：不会修改任何配置");
   assert.match(overlay.innerHTML, /只读自检/);
+  assert.match(run.body.children[1].innerHTML, /检测到插件加载失败/);
 });
 
 test("rescue client falls back to a diagnostic panel when the rescue service is down", async function () {
@@ -1542,10 +1556,59 @@ test("rescue client is idempotent when the script is evaluated twice", async fun
   vm.runInNewContext(clientText, run.sandbox, { filename: "rescue-client.js" });
   await flushClientWork();
   assert.equal(run.fetchCalls.length, 1);
-  assert.equal(run.body.children.length, 1);
+  assert.equal(run.body.children.length, 2);
 
   vm.runInNewContext(clientText, run.sandbox, { filename: "rescue-client.js" });
   await flushClientWork();
   assert.equal(run.fetchCalls.length, 1);
-  assert.equal(run.body.children.length, 1);
+  assert.equal(run.body.children.length, 2);
+});
+
+
+test("rescue client popups the standing rescue rows on a healthy UI", async function () {
+  const clientText = await readFile(CLIENT_PATH, "utf8");
+  const state = sampleClientState();
+  state.rescueRows = ["dsh-market"];
+  state.counts = { entries: 2, actionable: 0, rescue: 1 };
+  const run = createRescueSandbox({
+    clientText: clientText,
+    healthy: true,
+    text: "",
+    state: state
+  });
+  vm.runInNewContext(clientText, run.sandbox, { filename: "rescue-client.js" });
+  await flushClientWork();
+
+  assert.equal(run.fetchCalls.length, 1);
+  assert.equal(run.fetchCalls[0].url, "/dshm-boot-rescue/state");
+  assert.equal(run.body.children.length, 1, "healthy UI only gets the notice popup");
+  const dialog = run.body.children[0];
+  assert.match(dialog.className, /dbr-dialog/);
+  assert.match(dialog.innerHTML, /1 个插件由启动救援停用/);
+  assert.match(dialog.innerHTML, /dsh-market/);
+  assert.match(dialog.innerHTML, /立即恢复全部/);
+  assert.match(dialog.innerHTML, /data-dialog-action="restore"/);
+  assert.doesNotMatch(dialog.innerHTML, /dbr-overlay/);
+});
+
+test("rescue client shows the danger dialog for patch-fallback mode", async function () {
+  const clientText = await readFile(CLIENT_PATH, "utf8");
+  const state = sampleClientState();
+  state.mode = "patch-fallback";
+  state.warning = "本次停用重启应用后失效，请进入系统后立即卸载肇事插件";
+  const run = createRescueSandbox({
+    clientText: clientText,
+    text: "HARNESS\nFailed to load plugins\nfailed to import loader entry dshmarket (dsh-market)",
+    state: state
+  });
+  vm.runInNewContext(clientText, run.sandbox, { filename: "rescue-client.js" });
+  await flushClientWork();
+
+  assert.equal(run.fetchCalls.length, 1);
+  assert.equal(run.body.children.length, 2);
+  const dialog = run.body.children[1];
+  assert.match(dialog.className, /dbr-dialog/);
+  assert.match(dialog.innerHTML, /降级模式/);
+  assert.match(dialog.innerHTML, /本次停用重启应用后失效/);
+  assert.match(dialog.innerHTML, /打开恢复中心/);
 });
