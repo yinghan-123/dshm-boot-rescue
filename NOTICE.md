@@ -7,15 +7,15 @@
 - 抓取时间：2026-10-23
 - 仓库关系：自 2026-10-23 起 `yinghan-123/dshm-boot-rescue` 是上游的 **GitHub fork**
   （页头 forked from `huangshou1/dshm-boot-rescue`，可用 Sync fork 同步上游）。
-  下列改动以 2 条提交叠在上游历史之上：`27d1f190` 引入 1.0.0 副本、
-  `d684dbb4` 弹窗提示 1.1.0。
+  下列增量以多条提交叠在上游历史之上：`27d1f190` 引入 1.0.0 副本、
+  `d684dbb4` 弹窗提示 1.1.0、`03407cf9` 文档修正；当前版本 **1.1.1**。
 
 ## 与上游的差异
 
 | 文件 | 上游 blob sha1 | 本副本 |
 | --- | --- | --- |
 | `README.md` | `6ca31dc5…` | **已改**：安装命令指向本仓库，新增「弹窗提示」章节 |
-| `package.json` | `94432e66…` | **已改**：补 `repository` / `homepage` / `bugs`，版本 1.1.0 |
+| `package.json` | `94432e66…` | **已改**：补 `repository` / `homepage` / `bugs`，版本 1.1.1 |
 | `cordis.patch.yml` | `5841af2b…` | 未改动 |
 | `lib/index.js` | `0d906b6b…` | **已加固**，见下 |
 | `lib/rescue-client.js` | `4dfbbb0e…` | **已新增弹窗提示**（见下） |
