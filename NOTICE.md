@@ -5,17 +5,21 @@
 - 上游：<https://github.com/huangshou1/dshm-boot-rescue>
 - 分支 / commit：`main` / `3c0456576ba9aba327633bd1bc9f296fe854e08b`
 - 抓取时间：2026-10-23
+- 仓库关系：自 2026-10-23 起 `yinghan-123/dshm-boot-rescue` 是上游的 **GitHub fork**
+  （页头 forked from `huangshou1/dshm-boot-rescue`，可用 Sync fork 同步上游）。
+  下列改动以 2 条提交叠在上游历史之上：`27d1f190` 引入 1.0.0 副本、
+  `d684dbb4` 弹窗提示 1.1.0。
 
-## 与上游的差异（仅 1 个文件）
+## 与上游的差异
 
 | 文件 | 上游 blob sha1 | 本副本 |
 | --- | --- | --- |
-| `README.md` | `6ca31dc5…` | 未改动（仅安装段落占位符替换，见下） |
-| `package.json` | `94432e66…` | 仅补 `repository` / `homepage` 字段 |
+| `README.md` | `6ca31dc5…` | **已改**：安装命令指向本仓库，新增「弹窗提示」章节 |
+| `package.json` | `94432e66…` | **已改**：补 `repository` / `homepage` / `bugs`，版本 1.1.0 |
 | `cordis.patch.yml` | `5841af2b…` | 未改动 |
 | `lib/index.js` | `0d906b6b…` | **已加固**，见下 |
 | `lib/rescue-client.js` | `4dfbbb0e…` | **已新增弹窗提示**（见下） |
-| `test/rescue.test.mjs` | `9f14458f…` | 未改动 |
+| `test/rescue.test.mjs` | `9f14458f…` | **已随弹窗调整断言**（见下） |
 | `tools/check.mjs` | `e6bd5ee6…` | 未改动 |
 
 ### 加固 1：回环校验从「前缀匹配」改为严格 IPv4 字面量
