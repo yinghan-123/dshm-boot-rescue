@@ -155,7 +155,7 @@ pnpm add github:yinghan-123/dshm-boot-rescue
 | --- | --- | --- |
 | 失败页刚挂载救援面板 | 「检测到插件加载失败」 | 「打开恢复中心」关闭弹窗、露出面板 |
 | 失败页 + 降级模式（patch-fallback） | 红色「降级模式：本次停用重启后可能失效」 | 正文固定包含降级警示原文 |
-| 正常界面启动（无异常） | 「启动救援已就绪」：状态摘要 + 版本 | 「知道了」关闭；点遮罩也能关 |
+| 正常界面启动（无异常） | 「启动救援已就绪」：**日常检查清单**（7 项） | 「知道了」关闭；点遮罩也能关 |
 | 正常界面启动（存在救援停用项） | 「N 个插件由启动救援停用」，列出 entry id | 「立即恢复全部」撤销救援停用行；「稍后」忽略 |
 | 停用 / 恢复成功之后 | 「已停用 N 个插件」/「已恢复 N 个插件」 | 强调**必须划掉后台重新打开应用** |
 | 停用 / 恢复失败 | 「停用失败」/「恢复失败」 | 展示错误原因 |
@@ -167,8 +167,41 @@ pnpm add github:yinghan-123/dshm-boot-rescue
 - 操作结果类弹窗允许重复（每次停用 / 恢复都会弹一次）；
 - 支持 ESC 关闭、`role="dialog"` / `role="alertdialog"` 无障碍属性；
 - 弹窗只做提示与「恢复」入口，不会自动重载页面、不会自动跳转；
-- 正常界面每次页面加载弹一次状态提示（「启动救援已就绪」）；若存在救援停用项或已进入
-  降级模式，则改弹对应的强提醒，不再叠加就绪提示。
+- 正常界面每次页面加载弹一次状态提示（「启动救援已就绪」+ 日常检查清单）；若存在救援
+  停用项或已进入降级模式，则改弹对应的强提醒，强提醒里同样附检查清单；
+- 当救援服务完全不可用（连 `/state` 都拿不到）时，正常界面保持安静，不弹错误提示。
+
+### 日常检查
+
+每次 `/state` 请求都会生成一份**只读**检查结果（`state.checks`），客户端在弹窗里渲染成清单；
+宿主进程启动后第一次生成时会往 `$DSH_HOME/dshm-boot-rescue.log` 写一行
+「日常检查：救援服务=ok，数据目录=ok，…」。
+
+1.1.1 的固定 7 项（保留）+ 1.2.0 追加的 6 项，现在共 **13 项**：
+
+| 检查项 | 通过 | 注意 | 失败 |
+| --- | --- | --- | --- |
+| 救援服务 | 在线（带版本） | 降级模式（写 patch，重启后可能失效） | 只读（附只读原因） |
+| 数据目录 | 已定位 `DSH_HOME` / `DSHM_HOME` | — | 未找到 |
+| Profile | 已定位声明 `dsh.profile` 的目录 | — | 无法定位 |
+| 用户行文件 | 存在且结构正常 / 尚未创建（首次写入时自动创建） | 结构异常 → 已切换降级写入 | 无法读取 |
+| 写入目标 | profile 的 `.dshm-plugin-rows.yml` | `cordis.patch.yml`（降级） | 只读，无法写入 |
+| 救援停用项 | 无 | N 项（列出 entry id） | — |
+| 写入前备份 | 存在（大小）/ 尚无备份（首次写入时创建） | — | — |
+
+1.2.0 追加的 6 项：
+
+| 检查项 | 通过 | 注意 | 失败 |
+| --- | --- | --- | --- |
+| loader 状态 | 全部 active（附计数） | 有 pending（列出 entry id）；或读不到 loader（退回文案判定） | 有 failed |
+| 注入通道 | 双通道均可用（tapIndex + index-inject） | 只有单通道可用（附两边状态） | 两条都不可用 |
+| 救援台账 | 可读（N 条记录 / 空台账） | 损坏或读不出（恢复降级为只用注释标记） | — |
+| 良好快照 | 有快照（份数 + 最近一份时间/原因） | 还没有快照（启动 15 秒后自动创建） | — |
+| 启动失败残留 | 无残留 | 检测到 `.dshm-boot-failed`，或 N 个隔离文件可合并恢复 | — |
+| profile bundles | 可读（N 项，其中 M 项可被救援移除） | 读不出（附原因） | — |
+
+弹窗里的符号：`✓` 通过、`!` 注意、`✕` 失败。检查只读文件与内存状态，**不写任何文件**、
+不额外读 profile；唯一额外 I/O 是对备份文件的一次 `stat`。
 
 ---
 
@@ -206,6 +239,209 @@ pnpm add github:yinghan-123/dshm-boot-rescue
 本插件不会删除插件包、不会碰插件数据、不会动 `node_modules`，也不会清理别人的行。
 
 ---
+
+## 1.2.0 增强：从「写一行」到「多级可逆救援」
+
+1.1.1 只有一条路：把停用写进 `.dshm-plugin-rows.yml`，再划掉后台重开。1.2.0 在这条路
+旁边补齐了几条退路，核心原则没变：**不删插件包、不动 `node_modules`、所有写操作可逆、
+任何环节出错只降级不阻塞**。
+
+1.2.0 新增的落点与入口：
+
+| 能力 | 一句话 | 对应路由 |
+| --- | --- | --- |
+| 三级停用 | 用户行 → patch 降级 → 从 `dsh.profile.bundles` 移除 | `/disable`、`/disable-bundle`、`/restore-bundle` |
+| 运行期热停用 | 能热停用就「重新打开本页面」生效，不能才划掉后台 | `/disable`、`/safe-mode` 的 `hotDisabled` |
+| 救援台账 | 注释被 DSHM 插件页抹掉后，按行块指纹恢复 | 复用 `/restore` |
+| 良好快照 | 启动 15s 后自动存一份，可一键回滚 | `/snapshot`、`/rollback` |
+| 隔离残留恢复 | 识别 `.dshm-boot-failed` 与 `*.quarantine-*` 并合并 | `/quarantine/restore` |
+| 安全模式 | 一键停用全部非核心插件（二次确认） | `/safe-mode` |
+| 双通道注入 | `tapIndex` + `webserver/index-inject`，任一即可 | `/health` 的 `channels` |
+| loader 真实状态 | 直接读 `state.loader.pending/failed/missing`，不再靠文案猜 | `/state` 的 `loader` |
+| required 黑名单 | 宿主骨架 entry 永不停用 | `/state` 的 `protectedReason: "required"` |
+
+### 三级停用：用户行 → patch 降级 → bundles 移除
+
+同一个插件有三个落点，救援中心按「先轻后重」尝试：
+
+| 级别 | 写什么 | 何时用 | 跨重启 |
+| --- | --- | --- | --- |
+| `rows` | `.dshm-plugin-rows.yml` 加标记块 | 默认 | 持久 |
+| `patch` | `cordis.patch.yml` 加降级块 | 用户行文件结构非法 | 可能被 carry，不保证 |
+| `bundles` | 从 profile `package.json` 的 `dsh.profile.bundles` 里移除该项 | rows/patch 已写但插件仍参与启动，或用户行被插件页反复改写 | 持久、**不删包** |
+
+`bundles` 级的三条铁律，违反任意一条整单拒绝（`bundle-protected`，一个 id 非法就全单
+不执行，不做部分移除）：
+
+1. 名字以 `@deepseek-ai/` 开头的一律不可移除；`dshm-boot-rescue` 自己也不可移除；
+2. 剥离后数组**不允许为空**；
+3. 剥离后必须仍包含 `@deepseek-ai/dsh-base` 与 `@deepseek-ai/dsh-web-app`。
+
+移除只改 `dsh.profile.bundles` 数组：其余项**顺序不变**、`dependencies` /
+`peerDependencies` 不动、`node_modules` 不删。每个被移除项连同**原 index** 记进救援
+台账；「恢复 bundle 移除项」按原位置插回，原位置不存在（数组变短了）就追加到末尾。
+
+### 运行期热停用：先「重新打开本页面」
+
+停用成功后宿主会尝试在**当前进程内**热停用（`loader.update(id, {disabled:true})`，
+失败回退 `entry.update({disabled:true})`）。结果写在响应的 `hotDisabled` /
+`hotFailed` 里：
+
+- `hotDisabled` 非空：这些插件已经不再参与本进程的加载，**重新打开本页面即可生效**，
+  不用划掉后台；
+- `hotFailed` 或热停用没成功：仍然需要**划掉后台重新打开应用**。面板会照旧显示
+  「停用后请划掉后台重新打开应用」，不会假装成功。
+
+热停用只是「少一次重启」的加分项：它依赖宿主 loader 的运行时 API，拿不到就静默回退，
+绝不影响已经写进配置的持久停用。
+
+### 救援台账：注释被抹掉也能恢复
+
+`$DSH_HOME/dshm-boot-rescue-ledger.json` 是「注释没了怎么证明这行是我们写的」的答案。
+
+- 每次 `/disable` / `/disable-bundle` / `/safe-mode` 成功后 upsert 一条记录：
+  `{id, at, mode/level, file, blockDigest, fileDigestAfter, index?}`；
+- `blockDigest` = `sha256(id + "\u0000" + 归一化 disabled 值)`。归一化把
+  `true` / `True` / `" true "` 都算 `true`，**不含**标记注释——所以 DSHM 插件页抹掉
+  注释后指纹仍然对得上；
+- 恢复优先级：① 注释标记块（原有逻辑）→ ② 台账 + 指纹匹配 → ③ 台账里有、但行块被
+  改过或找不到 → **拒绝删除**并给出手改指引（`skipped` 里注明
+  `block-modified-or-missing` / `no-marker-no-ledger`）；
+- 删除行块成功后，对应台账条目一并移除；
+- 台账损坏（非法 JSON、结构不对）只会让 `ledger.ok=false`，恢复自动降级为「只用注释
+  标记」，**不阻塞**其它救援能力，也不影响插件启动。
+
+台账最多保留 200 条，按 `at` 倒序；它只是**兜底**，不是权威状态——真相永远在
+`.dshm-plugin-rows.yml` 里。
+
+### 良好快照：启动成功 15 秒后自动存一份
+
+「刚才还能进，停用之后进不去了」是最难处理的事故，所以 1.2.0 会在做得成事的时候
+先留退路：
+
+- 目录：`$DSH_HOME/dshm-boot-rescue-snapshots/<YYYYMMDD-HHMMSS>-<reason>/`；
+- 内容：`rows.yml`（用户行文件原样）、`profile-package.json`（profile 的
+  `package.json` 原样）、`meta.json`（id / 时间 / 原因 / 路径 / bundles 快照 / 版本）；
+- 自动时机：宿主 `apply()` 成功后 **15 秒**存一份 `reason:"startup"`（宿主起来了就是
+  好消息）；客户端检测到**健康 UI** 后再 `POST /snapshot {reason:"healthy"}`，30 秒内
+  去重，不重复写；
+- 保留 **`keep=5`** 份，超出删最旧的；
+- 一键回滚：`POST /rollback {"id":"…"}`（省略 id = 最近一份）→ 备份当前用户行 →
+  用快照覆盖 `rows.yml`；`profile-package.json` 存在时**只恢复
+  `dsh.profile.bundles` 数组**，不动 `dependencies`；全程原子写。
+
+回滚同样需要**划掉后台重新打开应用**才真正生效（回滚改的是持久配置）。
+
+### 隔离残留恢复：`.dshm-boot-failed` 与 `*.quarantine-*`
+
+DSHM 在 Host 级启动失败后会把用户行文件隔离、清空 profile 依赖再按纯种子启动。
+1.2.0 把这件事变成可恢复的：
+
+- `/state.quarantine` 报告：`bootFailed`（`$DSH_HOME/.dshm-boot-failed` 是否存在）、
+  `bootFailedAt`、`files[]`（profile 目录里匹配 `*.quarantine-*` /
+  `*.dshm-quarantine-*` / `*rows*.bak-*` 的文件，带字节数、可解析行数、可合并性）、
+  `profileDeps`（当前 profile 的 dependencies / peerDependencies）；
+- 面板「隔离残留」区块列出这些文件，每项一个「合并恢复」；
+- `POST /quarantine/restore {"name":"<文件名>"}` 的合并规则：
+  1. 目标固定是当前 `rowsPath`（`.dshm-plugin-rows.yml`）；
+  2. 隔离文件里解析出的 `- id:` 块，当前文件里**没有**该 id 才合并；
+     已有 → 跳过（`already-exists`）；`disabled` 值冲突 → 跳过（`conflict`）；
+  3. 合并时**保留隔离文件里的救援标记注释**，恢复后的行仍能被救援中心识别和撤销；
+  4. 写入前备份当前文件（`.dshm-boot-rescue.bak`），原子写、保留 BOM 与 CRLF；
+  5. 任何解析失败 → 整单拒绝（`quarantine-unmergeable`），**不做部分合并**。
+- 检测到残留时 `/state.notice` 非空，面板会提示「建议先合并恢复，或改用行内
+  『bundle 停用』」；但**不强制只读**——否则用户连救援能力都失去了。
+
+### 安全模式：一键停用全部非核心（二次确认）
+
+`POST /safe-mode {"confirm":true,"keep":["…"]}`：
+
+- 目标 = `entries` 里 `actionable && !builtin && !protected && id != 自己` 且不在
+  `keep` 里的全部 id；
+- 能走 rows 的先一次性批量写进用户行；对 `bundleRemovable` 且仍有风险的不再重复处理，
+  再走 bundles 移除；
+- 返回两级各自处理的 id（`levels.rows[]` / `levels.bundles[]`）、`kept[]`、
+  `skipped[]`（只读、降级、不可映射等）；
+- 按钮**必须二次点击**才执行，第一次只显示「将停用 N 个非核心插件」；
+- 没有 `confirm:true` 直接 400 `nothing-to-do`，防误触。
+
+安全模式是「先让系统能进来」的应急手段，不是日常操作。进来之后应当先去卸载真正的
+肇事插件，再逐项恢复。
+
+### 双通道注入：tapIndex + webserver/index-inject
+
+1.1.1 只靠 `webServer.tapIndex` 改 `index.html`。1.2.0 再挂一条
+`webserver/index-inject` 结构化注入通道（往注入表里加一条
+`{kind:"script-src", placement:"body", src:"/dshm-boot-rescue/client.js"}`）：
+
+- 两条通道**任一可用**脚本就能加载；都可用时客户端脚本本身幂等（哨兵
+  `__DSHM_BOOT_RESCUE__`），不会重复挂面板；
+- `/health` 新增 `indexInject` 与 `channels`（0..2）；`/state.checks` 的
+  `inject-channels` 会告诉你「双通道 / 单通道 / 都不可用」；
+- `indexInject` 取值：`ok` / `failed: …` / `unsupported`（宿主没有
+  `ctx.on("webserver/index-inject")` 时）。旧宿主没有这条通道也能正常工作。
+
+### loader 真实状态：不再只靠失败文案猜
+
+1.1.1 只能解析失败页文本猜「谁 pending」。1.2.0 直接读宿主 loader：
+
+```jsonc
+"loader": {
+  "ok": true, "reason": "",
+  "pending": [{ "id": "ui-chat", "name": "ui-chat", "missing": ["demo-service"] }],
+  "failed":  [{ "id": "dsh-market", "name": "dshmarket" }],
+  "counts": { "active": 12, "pending": 1, "failed": 0 }
+}
+```
+
+- 状态映射沿用 cordis `FiberState`：`0=pending 1=loading 2=active 3=failed 4=disposed`；
+- `missing` = `fiber.ctx.inject` 里声明了、但 `fiber.ctx.get(service) === undefined`
+  的服务名。面板会显示「缺服务：xxx」，比只看文案精确得多；
+- 客户端判定失败页的优先级：**loader 报告 pending/failed** 最高，其次才是失败文案；
+- 正常界面健康、但 loader 仍报 pending/failed 时，就绪弹窗会明确说出来，不会假装
+  「没有检测到失败」。
+
+### required 黑名单：宿主骨架永不停用
+
+`agent-loop` / `webserver` / `web-runtime` / `modules` / `connection` /
+`headless-runner` / `acp` / `sdk-jsonrpc-server` 这 8 个 entry 是宿主骨架——停掉它们
+连救援入口都会消失。它们一律 `protectedReason: "required"`、`actionable:false`，
+救援中心不会显示它们的停用按钮，安全模式也会跳过。
+
+### 新路由与新字段一览
+
+前缀仍是 `/dshm-boot-rescue`。写接口一律 `POST` + `application/json` + 回环校验。
+
+| 方法 | 路径 | 请求体 | 成功响应关键字段 |
+| --- | --- | --- | --- |
+| GET | `/health` | – | `ok version webServer loader route tapIndex indexInject channels injections mode` |
+| GET | `/state` | – | 见下 |
+| GET | `/client.js` | – | 脚本本体 |
+| GET | `/preview?shape=title\|pending\|import\|empty` | – | 自检页（`body[data-dshm-boot-rescue-shape]`） |
+| POST | `/disable` | `{"ids":[…]}` | `disabled[] already[] mode rescueRows[] warning level hotDisabled[] hotFailed[] notice` |
+| POST | `/restore` | `{"ids":[]}` | `restored[] skipped[] mode level markerRestored[] ledgerRestored[]` |
+| POST | `/disable-bundle` | `{"ids":[…]}` | `removed[] alreadyFailed[] mode:"bundles"` |
+| POST | `/restore-bundle` | `{"ids":[]}` | `restored[] skipped[]` |
+| POST | `/safe-mode` | `{"confirm":true,"keep":[…]}` | `levels{rows[],bundles[]} kept[] skipped[] hotDisabled[]` |
+| POST | `/snapshot` | `{"reason":"manual"}` | `id at path` |
+| POST | `/rollback` | `{"id":"…"}`（可省=最新） | `restoredFrom{id,at} rowsBytes bundlesRestored` |
+| POST | `/quarantine/restore` | `{"name":"<文件名>"}`（可省=唯一候选） | `merged[] skipped[] backup` |
+
+`/state` 在 1.1.1 的字段之外追加（只加不改）：
+
+- `entries[]` 每项新增 `inBundles` / `bundleRemovable` / `bundleName` /
+  `levels[]`（取值 `rows` | `patch` | `bundles`）；
+- 顶层新增：`features{ledger,snapshot,quarantine,bundles,dualInject}`（客户端据此决定
+  是否显示按钮，旧宿主没有就整块隐藏）、`inject{tapIndex,indexInject,channels}`、
+  `ledger{path,ok,error,entries[]}`、`bundles{path,ok,count,removable[],protected[]}`、
+  `quarantine{bootFailed,bootFailedAt,files[],profileDeps}`、
+  `snapshot{dir,ok,count,keep,latest}`、`loader{ok,reason,pending[],failed[],counts}`、
+  `notice`。
+
+新增错误码：`unknown-bundle`、`bundle-protected`、`nothing-to-do`、
+`snapshot-not-found`、`quarantine-not-found`、`quarantine-unmergeable`、
+`merge-conflict`；其余沿用 1.1.1 的 `self-protected` / `protected-id` /
+`not-actionable` / `unknown-id` / `read-only` 等。
 
 ## 降级模式（patch-fallback）
 
@@ -322,6 +558,13 @@ carry/重拼丢掉，就按 `- id: <id>` + `disabled: true` 找到对应块删�
 - 插件自身所有逻辑都在 `try/catch` 里，任何错误只记诊断日志，不影响宿主启动；
 - 不静态声明 `inject`，`webServer` / `loader` 都用 `ctx.get(...)` 判空，拿不到就降级，
   不会让插件树进入 pending。
+- **三级停用的 bundles 级只改 `dsh.profile.bundles` 数组**：删项不删包，
+  `@deepseek-ai/*` 与 `dsh-base` / `dsh-web-app` 受保护，清空或缺少核心项整单拒绝
+  （`bundle-protected`），一个非法 id 不做部分执行。
+- **台账 / 快照 / 诊断日志都写在 `$DSH_HOME` 内**；快照只保留最近 5 份，超出时删除的
+  是本插件自己的快照目录，不碰任何插件包；回滚前先备份当前用户行。
+- **隔离残留合并先备份后原子写，解析失败整单拒绝**（`quarantine-unmergeable`），
+  绝不部分合并；合并只追加缺失的 id，已有项与冲突项跳过。
 
 ---
 
@@ -337,8 +580,10 @@ carry/重拼丢掉，就按 `- id: <id>` + `disabled: true` 找到对应块删�
   **不是**本插件针对的 client pending 失败页；因此本插件写入的停用行可能在隔离后
   “消失”。排查时先看 `$DSH_HOME/.dshm-boot-failed`；隔离文件原样保留，可在确认环境
   后人工合并恢复。
-- **必须依赖 `tapIndex` 注入和 webServer 路由**。DSH 是大版本演进中的 developer
-  preview，如果上游改了渲染/注入接口，本插件可能需要跟进；拿不到能力时会降级并写日志。
+- **必须依赖注入通道和 webServer 路由**。1.2.0 起 `tapIndex` 与
+  `webserver/index-inject` 任一可用即可注入救援脚本，但两条都拿不到时仍然没有入口。
+  DSH 是大版本演进中的 developer preview，如果上游改了渲染/注入接口，本插件可能需要
+  跟进；拿不到能力时会降级并写日志。
 - **只能停用能映射到真实 entry id 的插件**。未映射到已知 entry id 的用户行会被标为
   「未映射」并禁止直接写入，避免写坏 profile。
 - **DSHM 插件页重写用户行会丢注释**，之后救援恢复会拒绝删除（但不会误删）。
@@ -353,6 +598,22 @@ carry/重拼丢掉，就按 `- id: <id>` + `disabled: true` 找到对应块删�
 - **不做远程救援**：默认只允许本机回环写操作，且没有额外认证，不要暴露到局域网。
 - 单元测试需要 PC 上的 **Node.js 24**（`node:test` + ESM）；DSHM 端侧没有 node CLI，
   测试是在 PC 上跑，不是端侧跑。
+- **热停用可能不可用**。`loader.update(id,{disabled:true})` 依赖宿主 loader 的运行时
+  API；拿不到、抛错、或该 entry 已经被别的插件接管时，会回退到「划掉后台重新打开
+  应用」。面板的 `hotFailed` 就是这种情况，不要指望每个插件都能热停用。
+- **救援台账只是兜底，不是权威状态**。它只能证明「某个 id 的这一行是本插件写过
+  的」；若有人手工改过 `disabled` 值、或同一 id 被别人也写了一行，指纹就不匹配，
+  恢复会拒绝删除并让你手改。台账损坏时功能自动降级为「只用注释标记」。
+- **bundles 移除不删 `node_modules`、也不等于卸载插件**。它只是把该项从 profile 的
+  `dsh.profile.bundles` 数组里摘掉；插件包、数据、依赖都原地保留，随时可以插回。
+  名字以 `@deepseek-ai/` 开头的内置 bundle 与 `dsh-base` / `dsh-web-app` 永远不可移除。
+- **隔离残留合并可能冲突**。隔离文件与当前用户行是两次不同时刻的快照：同 id 已有
+  配置会跳过（`already-exists`），`disabled` 值不同会跳过（`conflict`），解析失败
+  整单拒绝。合并不进去就别硬合并，先看 `/state.quarantine` 里的 `reason`。
+- **安全模式是应急手段**，会停掉所有非核心插件。它能让你进系统，但也会掩盖真正的
+  肇事者；进来后应尽快卸载问题插件，再逐项恢复。
+- **1.2.0 尚未发布到 GitHub**。仓库镜像与安装 spec 仍指向已发布版本；1.2.0 需要先
+  发布（`github:<owner>/dshm-boot-rescue#v1.2.0` 或本地安装）才能在端侧装到。
 
 ---
 
@@ -393,6 +654,16 @@ $DSH_HOME/dshm-boot-rescue.log
 - 健康检查：`http://127.0.0.1:3120/dshm-boot-rescue/health`
 - 救援脚本：`http://127.0.0.1:3120/dshm-boot-rescue/client.js`
 
+`/preview` 支持 4 种失败形态（1.2.0 追加），body 上带
+`data-dshm-boot-rescue-shape` 标记，用来验证客户端「文案变了也能识别」：
+
+| shape | 页面内容 | 验证什么 |
+| --- | --- | --- |
+| `title`（默认） | 1.1.1 那种标题式失败页 | 已知标题/正则 |
+| `pending` | 只有 `ui-chat: pending (waiting for service: …)` | 宽松 pending 信号 |
+| `import` | `dsh-market: import failed` + `web boot:` | import 失败文案 |
+| `empty` | 空 `#root` | 兜底小胶囊（15s 后出现）|
+
 自检页是**只读**的：搜索、筛选、勾选都能试，但所有写操作都会被禁用，状态会显示
 「只读自检：不会修改任何配置」。可以用它确认界面、诊断和交互是否正常，不必故意装
 一个坏插件。
@@ -428,9 +699,20 @@ node tools/check.mjs
 保护、ids 校验、回环地址判断、profile 定位、catalog 映射、state 结构，以及救援脚本的
 文本约束（检测正则、必备文案、无 reload / 无轮询 / 无 import 等）。
 
+1.2.0 追加的测试分组：救援台账（`blockDigestOf` 归一化指纹、
+`removeRowsByLedger` 的五个删除场景 + `readLedger` 损坏降级）、隔离残留
+（`parseQuarantineBlocks` / `mergeQuarantineRows` 的去重、protected、冲突、非法结构、
+空文件、CRLF）、profile bundles（`bundlesOfManifest` / `isProtectedBundleName` /
+`planBundleRemoval` 的原 index、保护名单、清空拒绝、核心 bundle 必留）、loader 真实
+状态（`fiberStateName` / `readLoaderDetails` 的 pending·failed·active·missing /
+`tryHotDisable` 的回退）、注入通道（`injectChannelCount`）、快照 id 格式、
+`snapshotIdNow`，以及救援脚本的 1.2.0 文本约束（新路由、新文案、哨兵、boot ready）。
+
 `tools/check.mjs` 做的是没有 node 环境时的替代自检：禁止模式、必备文案、
 `package.json` 约束、`cordis.patch.yml` 行 id、救援脚本的纯净性（无 import/require/
-Worker/WASM/setInterval、无自动刷新引导）。
+Worker/WASM/setInterval、无自动刷新引导）。1.2.0 追加：宿主必须导出救援纯函数、
+**禁止** `rmSync` / `rmdir` / 拼接 `node_modules` 后删除（不许真删插件包）、README
+必须出现新章节关键词，救援脚本的纯净性规则一条不放松。
 
 DSHM 端侧没有 node CLI，因此端侧不跑上述命令；端侧验收见下一节。
 
@@ -457,7 +739,19 @@ DSHM 端侧没有 node CLI，因此端侧不跑上述命令；端侧验收见下
    （可能只生效一轮，也可能继续；不要假设持久）；随后卸载肇事插件。
 6. **只读（可选）**：临时移走 `host-ready.json` 或让 profile 无法证明 → 面板进入只读，
    按钮禁用，展示原因与手改指引。
-7. **自检页**：在 `/dshm-boot-rescue/preview` 上尝试操作，确认不会产生任何文件写入。
+7. **自检页**：在 `/dshm-boot-rescue/preview` 上尝试操作，确认不会产生任何文件写入；
+   再依次打开 `?shape=pending|import|empty`，确认页面形态正确、写按钮仍禁用。
+8. **1.2.0 新字段**：`/health` 的 `channels >= 1`；`/state` 出现 `features` / `inject` /
+   `ledger` / `bundles` / `quarantine` / `snapshot` / `loader` / `notice`；
+   `checks` 共 13 项且没有 `fail`。
+9. **台账与快照**：救援停用一次后确认 `$DSH_HOME/dshm-boot-rescue-ledger.json` 里出现
+   该 id 与 `blockDigest`；启动 15 秒后确认
+   `$DSH_HOME/dshm-boot-rescue-snapshots/` 下出现 `*-startup` 目录；在面板「良好快照」
+   里点「立即存快照」后再「回滚到该快照」（各需二次确认）。
+10. **三级停用与安全模式（可选，测试 profile 上做）**：对一个测试插件点「bundle 停用」，
+    确认它从 profile `package.json` 的 `dsh.profile.bundles` 消失、`node_modules` 仍在，
+    再点「恢复 bundle 移除项」按原位置插回；最后（仅在愿意恢复的情况下）试一次
+    「安全模式」的二次确认与 `keep` 行为。
 
 ---
 

@@ -19,20 +19,39 @@ import {
   ROWS_FILE_NAME,
   apply,
   assertMutationRequest,
+  blockDigestOf,
   buildCatalog,
+  bundlesOfManifest,
   checkPatchAppendable,
+  describeBundles,
+  emptyLedgerState,
+  fiberStateName,
   findProfileDir,
+  injectChannelCount,
   isLoopbackAddress,
+  isProtectedBundleName,
+  listSnapshots,
+  mergeQuarantineRows,
   mutateTextFile,
   name,
+  normalizeDisabledValue,
   normalizeIds,
   parsePatchRows,
+  parseQuarantineBlocks,
   parseUserRows,
+  planBundleRemoval,
   readHostReadyProfile,
+  readLedger,
+  readLoaderDetails,
+  readProfileManifest,
   removeRescueRows,
+  removeRowsByLedger,
   renderDisableRows,
   renderPatchDisableRows,
   resolveHomeDir,
+  scanQuarantine,
+  snapshotIdNow,
+  tryHotDisable,
   version
 } from "../lib/index.js";
 
@@ -998,6 +1017,20 @@ test("apply serves state/health/preview and performs disable + restore end-to-en
     assert.equal(findEntry(state.entries, "core-chat"), undefined, "builtin seed row stays hidden");
 
     assert.deepEqual(state.counts, { entries: 3, actionable: 1, rescue: 0 });
+
+    // 日常检查：7 项固定检查，正常 rows 场景全部 ok
+    assert.equal(Array.isArray(state.checks), true);
+    // 1.2.0：日常检查从 7 项扩到 13 项（原 7 项仍在最前，顺序不变）。
+    assert.deepEqual(state.checks.map(function (item) { return item.id; }),
+      ["service", "home", "profile", "rows", "target", "rescue", "backup",
+        "loader", "inject-channels", "ledger", "snapshot", "quarantine", "bundles"]);
+    // 正常 rows 场景：除「良好快照」（首次启动还没有快照，warn）外全部 ok。
+    assert.equal(state.checks.filter(function (item) { return item.status === "ok"; }).length, 12);
+    assert.equal(state.checks.filter(function (item) { return item.id === "snapshot"; })[0].status, "warn");
+    assert.equal(state.checks[0].detail, "在线（v" + version + "）");
+    assert.equal(state.checks[4].detail, rowsPath);
+    assert.equal(state.checks[5].detail, "无");
+    assert.equal(state.checks[6].status, "ok");
     assert.equal(state.diagnostics.homeDir, "DSH_HOME");
     assert.equal(state.diagnostics.profileDir, "host-ready");
     assert.equal(state.diagnostics.webServer, "ok");
@@ -1009,16 +1042,18 @@ test("apply serves state/health/preview and performs disable + restore end-to-en
 
     response = await callRoute(fake.server.route, httpRequest("GET", "/dshm-boot-rescue/health"));
     assert.equal(response.statusCode, 200);
-    assert.deepEqual(parseResponse(response), {
-      ok: true,
-      version: version,
-      webServer: "ok",
-      loader: "ok",
-      route: "ok",
-      tapIndex: "ok",
-      injections: 0,
-      mode: "ready"
-    });
+    const health = parseResponse(response);
+    assert.equal(health.ok, true);
+    assert.equal(health.version, version);
+    assert.equal(health.webServer, "ok");
+    assert.equal(health.loader, "ok");
+    assert.equal(health.route, "ok");
+    assert.equal(health.tapIndex, "ok");
+    assert.equal(health.injections, 0);
+    assert.equal(health.mode, "ready");
+    // 1.2.0 追加：index-inject 通道与生效通道数（双通道都可用 = 2）。
+    assert.equal(health.indexInject, "ok");
+    assert.equal(health.channels, 2);
 
     response = await callRoute(fake.server.route, httpRequest("GET", "/dshm-boot-rescue/preview"));
     assert.equal(response.statusCode, 200);
@@ -1133,7 +1168,15 @@ test("apply serves state/health/preview and performs disable + restore end-to-en
       body: {}
     }));
     assert.equal(response.statusCode, 200);
-    assert.deepEqual(parseResponse(response), { ok: true, mode: "rows", restored: ["dsh-market"] });
+    const restored = parseResponse(response);
+    assert.equal(restored.ok, true);
+    assert.equal(restored.mode, "rows");
+    assert.deepEqual(restored.restored, ["dsh-market"]);
+    // 1.2.0 追加：区分「注释标记恢复」与「台账指纹恢复」。
+    assert.equal(restored.level, "rows");
+    assert.deepEqual(restored.markerRestored, ["dsh-market"]);
+    assert.deepEqual(restored.ledgerRestored, []);
+    assert.deepEqual(restored.skipped, []);
     assert.equal(await readFile(rowsPath, "utf8"), fixture.rows);
   });
 });
@@ -1158,6 +1201,11 @@ test("apply enters read-only mode when no usable data directory exists", async f
     assert.equal(state.homeDir, "");
     assert.deepEqual(state.entries, []);
     assert.deepEqual(state.rescueRows, []);
+    const readonlyStatus = function (id) {
+      return state.checks.filter(function (item) { return item.id === id; })[0].status;
+    };
+    assert.equal(readonlyStatus("service"), "fail");
+    assert.equal(readonlyStatus("home"), "fail");
   });
 });
 
@@ -1177,6 +1225,12 @@ test("apply uses patch fallback when the user row file is structurally invalid",
     assert.equal(state.writable, true);
     assert.equal(state.warning, FALLBACK_WARNING);
     assert.equal(findEntry(state.entries, "dsh-market").actionable, true);
+    const fallbackStatus = function (id) {
+      return state.checks.filter(function (item) { return item.id === id; })[0].status;
+    };
+    assert.equal(fallbackStatus("service"), "warn");
+    assert.equal(fallbackStatus("rows"), "warn");
+    assert.equal(fallbackStatus("target"), "warn");
 
     response = await callRoute(fake.server.route, httpRequest("POST", "/dshm-boot-rescue/disable", {
       body: { ids: ["dsh-market"] }
@@ -1203,11 +1257,13 @@ test("apply uses patch fallback when the user row file is structurally invalid",
       body: {}
     }));
     assert.equal(response.statusCode, 200);
-    assert.deepEqual(parseResponse(response), {
-      ok: true,
-      mode: "patch-fallback",
-      restored: ["dsh-market"]
-    });
+    const fallbackRestored = parseResponse(response);
+    assert.equal(fallbackRestored.ok, true);
+    assert.equal(fallbackRestored.mode, "patch-fallback");
+    assert.deepEqual(fallbackRestored.restored, ["dsh-market"]);
+    // 1.2.0 追加：降级模式的台账级别是 patch。
+    assert.equal(fallbackRestored.level, "patch");
+    assert.deepEqual(fallbackRestored.skipped, []);
     assert.equal(await readFile(patchPath, "utf8"), patchText);
   });
 });
@@ -1365,6 +1421,15 @@ function sampleClientState() {
     }],
     rescueRows: [],
     counts: { entries: 2, actionable: 1, rescue: 0 },
+    checks: [
+      { id: "service", label: "救援服务", status: "ok", detail: "在线（v1.0.0）" },
+      { id: "home", label: "数据目录", status: "ok", detail: "/tmp/home" },
+      { id: "profile", label: "Profile", status: "ok", detail: "/tmp/profile" },
+      { id: "rows", label: "用户行文件", status: "ok", detail: "存在，结构与救援标记正常" },
+      { id: "target", label: "写入目标", status: "ok", detail: "/tmp/profile/.dshm-plugin-rows.yml" },
+      { id: "rescue", label: "救援停用项", status: "ok", detail: "无" },
+      { id: "backup", label: "写入前备份", status: "ok", detail: "尚无备份，首次写入时创建" }
+    ],
     diagnostics: {}
   };
 }
@@ -1448,6 +1513,9 @@ test("rescue client never mounts on a healthy UI that merely quotes failure text
   assert.match(readyDialog.className, /dbr-dialog/);
   assert.match(readyDialog.innerHTML, /启动救援已就绪/);
   assert.match(readyDialog.innerHTML, /DSHM 已正常启动/);
+  assert.match(readyDialog.innerHTML, /dbr-checks/);
+  assert.match(readyDialog.innerHTML, /日常检查/);
+  assert.match(readyDialog.innerHTML, /救援停用项/);
   assert.doesNotMatch(readyDialog.innerHTML, /dbr-overlay/);
 });
 
@@ -1612,3 +1680,765 @@ test("rescue client shows the danger dialog for patch-fallback mode", async func
   assert.match(dialog.innerHTML, /本次停用重启应用后失效/);
   assert.match(dialog.innerHTML, /打开恢复中心/);
 });
+
+
+// ══════════════════════════════════════════════════════════════════════════
+// 1.2.0 增强：救援台账 / 隔离残留 / 三级停用（profile bundles）/ 快照
+// ══════════════════════════════════════════════════════════════════════════
+
+function ledgerTarget(id, disabledValue) {
+  return { id: id, blockDigest: blockDigestOf(id, disabledValue) };
+}
+
+async function createBundleProfile(t, bundles) {
+  const root = await temporaryDirectory(t);
+  const home = join(root, "home");
+  const profile = join(home, "profiles", "ondevice");
+  await mkdir(profile, { recursive: true });
+  const manifest = {
+    name: "ondevice",
+    dsh: { profile: { bundles: bundles } },
+    dependencies: { "dsh-meme": "1.0.0" }
+  };
+  await writeFile(join(profile, "package.json"), JSON.stringify(manifest, null, 2) + "\n", "utf8");
+  return { root: root, home: home, profile: profile, manifest: manifest };
+}
+
+// ── 救援台账：指纹归一化 ────────────────────────────────────────────────────
+
+test("normalizeDisabledValue folds true/True/yes/1 into one canonical value", function () {
+  const truthy = [true, "true", "True", " TRUE ", "yes", "1", 1];
+  for (const value of truthy) {
+    assert.equal(normalizeDisabledValue(value), "true", String(value));
+  }
+  const falsy = [false, "false", "False", " false ", "no", "0", 0];
+  for (const value of falsy) {
+    assert.equal(normalizeDisabledValue(value), "false", String(value));
+  }
+  assert.equal(normalizeDisabledValue("maybe"), "maybe");
+  assert.equal(normalizeDisabledValue(""), "");
+  assert.equal(normalizeDisabledValue(null), "");
+  assert.equal(normalizeDisabledValue(undefined), "");
+});
+
+test("blockDigestOf fingerprints only id + normalized disabled value", function () {
+  const digest = blockDigestOf("dsh-meme", true);
+  assert.match(digest, /^sha256:[0-9a-f]{64}$/);
+  // true / True / " true " 必须等价（DSHM 插件页会改写大小写与空白）。
+  assert.equal(blockDigestOf("dsh-meme", "True"), digest);
+  assert.equal(blockDigestOf("dsh-meme", " true "), digest);
+  assert.equal(blockDigestOf("dsh-meme", "yes"), digest);
+  // true ≠ false；不同 id 不同指纹。
+  assert.notEqual(blockDigestOf("dsh-meme", false), digest);
+  assert.notEqual(blockDigestOf("dsh-other", true), digest);
+  // 指纹不含标记注释：同一 id + 值的块在任何注释状态下都一样。
+  assert.equal(blockDigestOf("dsh-meme", true), blockDigestOf("dsh-meme", "true"));
+});
+
+test("emptyLedgerState and readLedger degrade instead of throwing", async function (t) {
+  assert.deepEqual(emptyLedgerState("/tmp/ledger.json"), {
+    path: "/tmp/ledger.json", ok: false, error: "", entries: []
+  });
+  assert.deepEqual(emptyLedgerState(""), { path: "", ok: false, error: "", entries: [] });
+
+  const root = await temporaryDirectory(t);
+  const home = join(root, "home");
+  await mkdir(home, { recursive: true });
+  const runtime = { homeDir: home };
+  const ledgerPath = join(home, "dshm-boot-rescue-ledger.json");
+
+  // 没有台账 = 空台账（不是错误）。
+  const missing = readLedger(runtime);
+  assert.equal(missing.ok, true);
+  assert.equal(missing.error, "");
+  assert.equal(missing.path, ledgerPath);
+  assert.deepEqual(missing.entries, []);
+
+  // 没有 data 目录 → 降级，但绝不抛错。
+  const unresolved = readLedger({});
+  assert.equal(unresolved.ok, false);
+  assert.match(unresolved.error, /数据目录未定位/);
+
+  // 损坏 JSON → 只降级（客户端会退回「只用注释标记」）。
+  await writeFile(ledgerPath, "{ not json", "utf8");
+  const corrupt = readLedger(runtime);
+  assert.equal(corrupt.ok, false);
+  assert.match(corrupt.error, /台账内容损坏/);
+  assert.deepEqual(corrupt.entries, []);
+
+  // 结构非法（entries 不是数组）同样降级。
+  await writeFile(ledgerPath, JSON.stringify({ version: 1, entries: { id: "x" } }), "utf8");
+  assert.equal(readLedger(runtime).ok, false);
+
+  // 正常台账：过滤坏条目、level 归一化、按 at 倒序。
+  await writeFile(ledgerPath, JSON.stringify({
+    version: 1,
+    entries: [
+      { id: "old-row", at: "2026-01-01T00:00:00.000Z", level: "rows", blockDigest: blockDigestOf("old-row", true) },
+      { id: "bundle-row", at: "2026-02-02T00:00:00.000Z", mode: "bundles", index: 3 },
+      { id: "weird-level", at: "2026-01-15T00:00:00.000Z", level: "nonsense" },
+      { id: "", at: "2026-01-16T00:00:00.000Z" },
+      null,
+      { id: "patch-row", at: "2026-01-20T00:00:00.000Z", mode: "patch" }
+    ]
+  }, null, 2), "utf8");
+  const ledger = readLedger(runtime);
+  assert.equal(ledger.ok, true);
+  assert.equal(ledger.error, "");
+  assert.deepEqual(ledger.entries.map(function (item) { return item.id; }),
+    ["bundle-row", "patch-row", "weird-level", "old-row"]);
+  const byId = function (id) {
+    return ledger.entries.filter(function (item) { return item.id === id; })[0];
+  };
+  assert.equal(byId("bundle-row").level, "bundles");
+  assert.equal(byId("bundle-row").mode, "bundles");
+  assert.equal(byId("bundle-row").index, 3);
+  assert.equal(byId("patch-row").level, "patch");
+  // 未知 level 归一到 rows，避免恢复时用错级别。
+  assert.equal(byId("weird-level").level, "rows");
+  assert.equal(byId("old-row").blockDigest, blockDigestOf("old-row", true));
+  assert.equal(byId("old-row").fileDigestAfter, "");
+});
+
+// ── 救援台账：按指纹删除行块（五个场景）────────────────────────────────────
+
+test("removeRowsByLedger deletes a marked block together with its comment", function () {
+  const source = [
+    "# 用户行",
+    ROW_MARKER + "dsh-meme",
+    "- id: dsh-meme",
+    "  disabled: true",
+    "- id: kept-row",
+    "  disabled: false",
+    ""
+  ].join("\n");
+  const output = removeRowsByLedger(source, [ledgerTarget("dsh-meme", true)]);
+  assert.deepEqual(output.result.restored, ["dsh-meme"]);
+  assert.deepEqual(output.result.skipped, []);
+  // 标记注释行必须一起删掉，其它行逐字节保留。
+  assert.equal(output.text, "# 用户行\n- id: kept-row\n  disabled: false\n");
+});
+
+test("removeRowsByLedger still deletes the block after the marker comment was wiped", function () {
+  const source = "- id: dsh-meme\n  disabled: true\n- id: kept-row\n  disabled: false\n";
+  const output = removeRowsByLedger(source, [ledgerTarget("dsh-meme", true)]);
+  assert.deepEqual(output.result.restored, ["dsh-meme"]);
+  assert.equal(output.text, "- id: kept-row\n  disabled: false\n");
+
+  // 归一化后的值（yes → true）也算「本插件写过」。
+  const normalized = removeRowsByLedger("- id: dsh-meme\n  disabled: yes\n", [ledgerTarget("dsh-meme", true)]);
+  assert.deepEqual(normalized.result.restored, ["dsh-meme"]);
+  assert.equal(normalized.text, "");
+});
+
+test("removeRowsByLedger never deletes a disabled:false block", function () {
+  const source = "- id: dsh-meme\n  disabled: false\n- id: kept-row\n  disabled: true\n";
+  // 即使台账里记的是 false，也不删：救援只撤销自己写下的「停用」。
+  const output = removeRowsByLedger(source, [ledgerTarget("dsh-meme", false)]);
+  assert.deepEqual(output.result.restored, []);
+  assert.equal(output.text, source);
+});
+
+test("removeRowsByLedger refuses blocks whose fingerprint does not match", function () {
+  const source = "- id: dsh-meme\n  disabled: true\n";
+  const output = removeRowsByLedger(source, [{
+    id: "dsh-meme",
+    blockDigest: blockDigestOf("dsh-other", true)
+  }]);
+  assert.deepEqual(output.result.restored, []);
+  assert.equal(output.text, source);
+  // 空 targets 原样返回。
+  const untouched = removeRowsByLedger(source, []);
+  assert.deepEqual(untouched.result.restored, []);
+  assert.equal(untouched.text, source);
+});
+
+test("removeRowsByLedger never deletes builtin @deepseek-ai rows even with a matching digest", function () {
+  const source = "- id: '@deepseek-ai/dsh-base'\n  disabled: true\n";
+  const output = removeRowsByLedger(source, [{
+    id: "@deepseek-ai/dsh-base",
+    blockDigest: blockDigestOf("@deepseek-ai/dsh-base", true)
+  }]);
+  assert.deepEqual(output.result.restored, []);
+  assert.equal(output.text, source);
+
+  const self = "- id: dshm-boot-rescue\n  disabled: true\n";
+  const selfOutput = removeRowsByLedger(self, [ledgerTarget("dshm-boot-rescue", true)]);
+  assert.deepEqual(selfOutput.result.restored, []);
+  assert.equal(selfOutput.text, self);
+});
+
+// ── 隔离残留：解析与合并 ────────────────────────────────────────────────────
+
+test("parseQuarantineBlocks keeps marker comments, extra fields and skips illegal ids", function () {
+  const source = [
+    "# 隔离文件",
+    ROW_MARKER + "dsh-meme",
+    "- id: dsh-meme",
+    "  disabled: true",
+    "- id: dsh-tool",
+    "  name: dshtool",
+    "  disabled: false",
+    "- id: bad id",
+    "  disabled: true",
+    "- id:",
+    "  disabled: true",
+    ""
+  ].join("\n");
+  const parsed = parseQuarantineBlocks(source);
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.blocks.length, 2);
+
+  const meme = parsed.blocks[0];
+  assert.equal(meme.id, "dsh-meme");
+  assert.equal(meme.disabled, true);
+  assert.equal(meme.hasMarker, true);
+  assert.deepEqual(meme.lines, [ROW_MARKER + "dsh-meme", "- id: dsh-meme", "  disabled: true"]);
+
+  // 其它字段（name:）属于同一个块，不能被当成下一块的开始。
+  const tool = parsed.blocks[1];
+  assert.equal(tool.id, "dsh-tool");
+  assert.equal(tool.disabled, false);
+  assert.equal(tool.hasMarker, false);
+  assert.deepEqual(tool.lines, ["- id: dsh-tool", "  name: dshtool", "  disabled: false"]);
+
+  // 非法 id（含空格 / 空 id）整块跳过，绝不产生半块。
+  assert.equal(parsed.blocks.filter(function (block) { return block.id === "bad id"; }).length, 0);
+});
+
+test("mergeQuarantineRows only merges missing ids and reports skip reasons", function () {
+  const current = "# 用户行\n- id: kept-row\n  disabled: false\n";
+  const quarantine = [
+    ROW_MARKER + "dsh-meme",
+    "- id: dsh-meme",
+    "  disabled: true",
+    "- id: kept-row",
+    "  disabled: true",
+    "- id: '@deepseek-ai/dsh-base'",
+    "  disabled: true",
+    ""
+  ].join("\n");
+  const merged = mergeQuarantineRows(current, quarantine);
+  assert.equal(merged.ok, true);
+  assert.deepEqual(merged.merged, ["dsh-meme"]);
+  assert.deepEqual(merged.skipped, [
+    { id: "kept-row", reason: "already-exists" },
+    { id: "@deepseek-ai/dsh-base", reason: "protected" }
+  ]);
+  // 合并时保留隔离文件里的救援标记注释，恢复后仍可被救援中心识别。
+  assert.equal(merged.text,
+    "# 用户行\n- id: kept-row\n  disabled: false\n"
+    + ROW_MARKER + "dsh-meme\n- id: dsh-meme\n  disabled: true\n");
+});
+
+test("mergeQuarantineRows fails closed when the current rows file is structurally invalid", function () {
+  const quarantine = "- id: dsh-meme\n  disabled: true\n";
+  const merged = mergeQuarantineRows("settings:\n  enabled: true\n", quarantine);
+  assert.equal(merged.ok, false);
+  assert.match(merged.reason, /当前用户行文件结构无法安全解析/);
+  assert.deepEqual(merged.merged, []);
+  assert.deepEqual(merged.skipped, []);
+  assert.equal(merged.text, "settings:\n  enabled: true\n");
+});
+
+test("mergeQuarantineRows leaves an empty quarantine file byte-for-byte untouched", function () {
+  const current = "# 用户行\n- id: kept-row\n  disabled: false\n";
+  for (const quarantine of ["", "# 只有注释\n", "\n\n"]) {
+    const merged = mergeQuarantineRows(current, quarantine);
+    assert.equal(merged.ok, true);
+    assert.deepEqual(merged.merged, []);
+    assert.equal(merged.text, current);
+  }
+});
+
+test("mergeQuarantineRows keeps BOM and CRLF when appending", function () {
+  const current = "\uFEFF# 用户行\r\n- id: kept-row\r\n  disabled: false\r\n";
+  const merged = mergeQuarantineRows(current, "- id: dsh-meme\n  disabled: true\n");
+  assert.equal(merged.ok, true);
+  assert.deepEqual(merged.merged, ["dsh-meme"]);
+  assert.ok(merged.text.startsWith("\uFEFF"), "BOM 必须保留");
+  // 没有孤立的 LF：每个 \n 都属于一个 \r\n。
+  assert.equal(merged.text.split("\n").length - 1, merged.text.split("\r\n").length - 1);
+});
+
+// ── 三级停用：profile 的 dsh.profile.bundles ────────────────────────────────
+
+test("bundlesOfManifest dedupes strings, drops non-strings and tolerates null", function () {
+  assert.deepEqual(bundlesOfManifest({
+    dsh: { profile: { bundles: ["a", "b", "a", "", 42, null, "b"] } }
+  }), ["a", "b"]);
+  assert.deepEqual(bundlesOfManifest({ dsh: { profile: { bundles: "a" } } }), []);
+  assert.deepEqual(bundlesOfManifest({ dsh: {} }), []);
+  assert.deepEqual(bundlesOfManifest({}), []);
+  assert.deepEqual(bundlesOfManifest(null), []);
+  assert.deepEqual(bundlesOfManifest(undefined), []);
+});
+
+test("isProtectedBundleName protects @deepseek-ai/*, itself and empty names", function () {
+  assert.equal(isProtectedBundleName("@deepseek-ai/dsh-base"), true);
+  assert.equal(isProtectedBundleName("@deepseek-ai/dsh-web-app"), true);
+  assert.equal(isProtectedBundleName("@deepseek-ai/"), true);
+  assert.equal(isProtectedBundleName("dshm-boot-rescue"), true);
+  assert.equal(isProtectedBundleName(""), true);
+  assert.equal(isProtectedBundleName(null), true);
+  assert.equal(isProtectedBundleName(undefined), true);
+  assert.equal(isProtectedBundleName("dsh-meme"), false);
+  assert.equal(isProtectedBundleName("@scope/plugin"), false);
+});
+
+test("readProfileManifest reports unreadable or missing profiles without throwing", async function (t) {
+  const fixture = await createBundleProfile(t, ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"]);
+  const manifest = readProfileManifest({ profileDir: fixture.profile });
+  assert.equal(manifest.ok, true);
+  assert.equal(manifest.path, join(fixture.profile, "package.json"));
+  assert.equal(manifest.json.name, "ondevice");
+
+  const unresolved = readProfileManifest({});
+  assert.equal(unresolved.ok, false);
+  assert.match(unresolved.error, /profile 目录未定位/);
+
+  await writeFile(join(fixture.profile, "package.json"), "{ nope", "utf8");
+  const broken = readProfileManifest({ profileDir: fixture.profile });
+  assert.equal(broken.ok, false);
+  assert.match(broken.error, /读取 profile package\.json 失败/);
+});
+
+test("describeBundles maps bundle names back to entry ids and lists protected ones", async function (t) {
+  const fixture = await createBundleProfile(t, [
+    "@deepseek-ai/dsh-base", "dsh-meme", "@deepseek-ai/dsh-web-app"
+  ]);
+  const described = describeBundles({ profileDir: fixture.profile }, [
+    { id: "dsh-expression", bundleName: "dsh-meme" },
+    { id: "dsh-meme", bundleName: "dsh-meme" },
+    { id: "core-chat", bundleName: "@deepseek-ai/dsh-base" }
+  ]);
+  assert.equal(described.ok, true);
+  assert.equal(described.count, 3);
+  assert.deepEqual(described.removable, [{ name: "dsh-meme", entries: ["dsh-expression", "dsh-meme"] }]);
+  assert.deepEqual(described.protected, ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"]);
+});
+
+test("planBundleRemoval records original indexes and keeps the remaining order", async function (t) {
+  const fixture = await createBundleProfile(t, [
+    "@deepseek-ai/dsh-base", "dsh-market", "dsh-tool",
+    "@deepseek-ai/dsh-web-app", "dsh-meme"
+  ]);
+  const runtime = { homeDir: fixture.home, profileDir: fixture.profile };
+
+  const plan = planBundleRemoval(runtime, ["dsh-tool"]);
+  assert.deepEqual(plan.list, [
+    "@deepseek-ai/dsh-base", "dsh-market", "dsh-tool",
+    "@deepseek-ai/dsh-web-app", "dsh-meme"
+  ]);
+  // 原 index 必须记下来，恢复时按原位置插回。
+  assert.deepEqual(plan.removals, [{ name: "dsh-tool", index: 2 }]);
+  assert.deepEqual(plan.already, []);
+  // 其余项顺序不变。
+  assert.deepEqual(plan.nextList, [
+    "@deepseek-ai/dsh-base", "dsh-market", "@deepseek-ai/dsh-web-app", "dsh-meme"
+  ]);
+
+  // 不在 bundles 里的名字进 already，不抛错，也不影响其它项。
+  const missing = planBundleRemoval(runtime, ["not-in-bundles", "dsh-tool"]);
+  assert.deepEqual(missing.already, ["not-in-bundles"]);
+  assert.deepEqual(missing.removals, [{ name: "dsh-tool", index: 2 }]);
+
+  // 重复名字只记一次。
+  const deduped = planBundleRemoval(runtime, ["dsh-tool", "dsh-tool"]);
+  assert.equal(deduped.removals.length, 1);
+});
+
+test("planBundleRemoval fails closed on protected, empty and core-less bundles", async function (t) {
+  const fixture = await createBundleProfile(t, [
+    "@deepseek-ai/dsh-base", "dsh-market", "@deepseek-ai/dsh-web-app"
+  ]);
+  const runtime = { homeDir: fixture.home, profileDir: fixture.profile };
+  const expectBundleProtected = function (names) {
+    assert.throws(function () {
+      planBundleRemoval(runtime, names);
+    }, function (error) {
+      return !!error && error.code === "bundle-protected";
+    });
+  };
+
+  // 内置 bundle 与插件自身一律不可移除。
+  expectBundleProtected(["@deepseek-ai/dsh-base"]);
+  expectBundleProtected(["@deepseek-ai/dsh-web-app"]);
+  expectBundleProtected(["dshm-boot-rescue"]);
+  // 普通项也必须在 @deepseek-ai/* 的整单拒绝范围内：一个非法 id 整单不执行。
+  expectBundleProtected(["dsh-market", "@deepseek-ai/dsh-base"]);
+
+  // 清空拒绝：只剩非保护项时不允许全部摘掉。
+  const empties = await createBundleProfile(t, ["dsh-a", "dsh-b"]);
+  assert.throws(function () {
+    planBundleRemoval({ homeDir: empties.home, profileDir: empties.profile }, ["dsh-a", "dsh-b"]);
+  }, function (error) {
+    return !!error && error.code === "bundle-protected" && /拒绝清空/.test(error.message);
+  });
+
+  // 缺 dsh-base 或 dsh-web-app 拒绝。
+  const noBase = await createBundleProfile(t, ["dsh-a", "@deepseek-ai/dsh-web-app"]);
+  assert.throws(function () {
+    planBundleRemoval({ homeDir: noBase.home, profileDir: noBase.profile }, ["dsh-a"]);
+  }, function (error) {
+    return !!error && error.code === "bundle-protected" && /dsh-base/.test(error.message);
+  });
+  const noWebApp = await createBundleProfile(t, ["dsh-a", "@deepseek-ai/dsh-base"]);
+  assert.throws(function () {
+    planBundleRemoval({ homeDir: noWebApp.home, profileDir: noWebApp.profile }, ["dsh-a"]);
+  }, function (error) {
+    return !!error && error.code === "bundle-protected" && /dsh-web-app/.test(error.message);
+  });
+});
+
+// ── 良好快照：id 格式 / 列表 ────────────────────────────────────────────────
+
+test("snapshotIdNow formats YYYYMMDD-HHMMSS-<reason> and sanitizes the reason", function () {
+  assert.match(snapshotIdNow("healthy"), /^\d{8}-\d{6}-healthy$/);
+  assert.match(snapshotIdNow("startup"), /^\d{8}-\d{6}-startup$/);
+  // 空 / 非法 reason 一律回退 manual。
+  assert.match(snapshotIdNow(""), /^\d{8}-\d{6}-manual$/);
+  assert.match(snapshotIdNow(undefined), /^\d{8}-\d{6}-manual$/);
+  // 大写、空格、斜杠、下划线都归一化成连字符。
+  assert.match(snapshotIdNow("A B/C_1"), /^\d{8}-\d{6}-a-b-c-1$/);
+  // reason 最多 16 个字符，避免目录名过长。
+  assert.match(snapshotIdNow("x".repeat(40)), /^\d{8}-\d{6}-x{16}$/);
+});
+
+test("listSnapshots lists only valid snapshot directories and tolerates a missing root", async function (t) {
+  const root = await temporaryDirectory(t);
+  const home = join(root, "home");
+  const snapshotRoot = join(home, "dshm-boot-rescue-snapshots");
+
+  const missing = listSnapshots({ homeDir: home });
+  assert.equal(missing.ok, true);
+  assert.deepEqual(missing.items, []);
+  assert.equal(missing.dir, snapshotRoot);
+  assert.equal(listSnapshots({}).ok, false);
+
+  await mkdir(join(snapshotRoot, "20261024-121500-healthy"), { recursive: true });
+  await writeFile(join(snapshotRoot, "20261024-121500-healthy", "meta.json"), JSON.stringify({
+    id: "20261024-121500-healthy", at: "2026-10-24T12:15:00.000Z",
+    reason: "healthy", rowsBytes: 42, bundles: ["dsh-meme"]
+  }), "utf8");
+  await mkdir(join(snapshotRoot, "20261024-130000-startup"), { recursive: true });
+  await writeFile(join(snapshotRoot, "20261024-130000-startup", "meta.json"), JSON.stringify({
+    id: "20261024-130000-startup", at: "2026-10-24T13:00:00.000Z",
+    reason: "startup", rowsBytes: 10, bundles: []
+  }), "utf8");
+  // 目录名不合法 / meta.json 缺失 → 跳过，不让 state 崩。
+  await mkdir(join(snapshotRoot, "not-a-snapshot"), { recursive: true });
+  await mkdir(join(snapshotRoot, "20261025-000000-broken"), { recursive: true });
+
+  const listed = listSnapshots({ homeDir: home });
+  assert.equal(listed.ok, true);
+  assert.deepEqual(listed.items.map(function (item) { return item.id; }),
+    ["20261024-130000-startup", "20261024-121500-healthy"]);
+  const healthy = listed.items[1];
+  assert.equal(healthy.reason, "healthy");
+  assert.equal(healthy.rowsBytes, 42);
+  assert.equal(healthy.bundlesCount, 1);
+  assert.equal(healthy.dir, join(snapshotRoot, "20261024-121500-healthy"));
+});
+
+// ── 启动失败残留：扫描 ──────────────────────────────────────────────────────
+
+test("scanQuarantine reports the boot-failed marker and mergeable quarantine files", async function (t) {
+  const fixture = await createBundleProfile(t, ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"]);
+  await writeFile(join(fixture.home, ".dshm-boot-failed"), "1\n", "utf8");
+  const quarantineName = ".dshm-plugin-rows.yml.quarantine-1761177600000";
+  await writeFile(join(fixture.profile, quarantineName), [
+    ROW_MARKER + "dsh-meme",
+    "- id: dsh-meme",
+    "  disabled: true",
+    "- id: dsh-tool",
+    "  disabled: false",
+    ""
+  ].join("\n"), "utf8");
+  // 不匹配 QUARANTINE_PATTERN 的文件不列入。
+  await writeFile(join(fixture.profile, "notes.txt"), "ignored", "utf8");
+
+  const scan = scanQuarantine({ homeDir: fixture.home, profileDir: fixture.profile });
+  assert.equal(scan.bootFailed, true);
+  assert.match(scan.bootFailedAt, /^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(scan.files.length, 1);
+  const file = scan.files[0];
+  assert.equal(file.name, quarantineName);
+  assert.equal(file.rows, 2);
+  assert.equal(file.rescueBlocks, 1);
+  assert.equal(file.mergeable, true);
+  assert.equal(file.reason, "");
+  assert.ok(file.bytes > 0);
+  // profile 依赖照原样报告，用于判断隔离后要不要重装。
+  assert.deepEqual(scan.profileDeps.dependencies, ["dsh-meme"]);
+  assert.deepEqual(scan.profileDeps.peerDependencies, []);
+
+  // home 与 profile 都不存在时全部为空，不抛错。
+  const clean = scanQuarantine({
+    homeDir: join(fixture.root, "clean-home"),
+    profileDir: join(fixture.root, "clean-profile")
+  });
+  assert.equal(clean.bootFailed, false);
+  assert.deepEqual(clean.files, []);
+  assert.deepEqual(clean.profileDeps, { dependencies: [], peerDependencies: [] });
+});
+
+// ── loader 真实状态（G）：不再只靠失败文案猜 ───────────────────────────────
+
+test("fiberStateName maps cordis FiberState 0..4 and falls back to unknown", function () {
+  assert.equal(fiberStateName(0), "pending");
+  assert.equal(fiberStateName(1), "loading");
+  assert.equal(fiberStateName(2), "active");
+  assert.equal(fiberStateName(3), "failed");
+  assert.equal(fiberStateName(4), "disposed");
+  assert.equal(fiberStateName("2"), "active");
+  assert.equal(fiberStateName(5), "unknown");
+  assert.equal(fiberStateName(-1), "unknown");
+  assert.equal(fiberStateName(null), "unknown");
+  assert.equal(fiberStateName(undefined), "unknown");
+  assert.equal(fiberStateName("x"), "unknown");
+});
+
+function fakeLoaderContext(entries) {
+  const loader = { entries: function () { return entries; } };
+  return {
+    get: function (service) {
+      return service === "loader" ? loader : undefined;
+    }
+  };
+}
+
+test("readLoaderDetails reports pending/failed/active and the missing services", function () {
+  const pendingEntry = {
+    options: { id: "ui-chat", name: "ui-chat" },
+    fiber: {
+      state: 0,
+      ctx: {
+        inject: { webServer: {}, demoService: {} },
+        get: function (service) { return service === "webServer" ? {} : undefined; }
+      }
+    }
+  };
+  const activeEntry = {
+    options: { id: "dsh-market", name: "dshmarket" },
+    fiber: { state: 2, ctx: { inject: {}, get: function () { return undefined; } } }
+  };
+  const failedEntry = {
+    options: { id: "dsh-broken", name: "broken" },
+    fiber: { state: 3 }
+  };
+  const noFiber = { options: { id: "dsh-quiet", name: "quiet" } };
+  const noId = { options: {} };
+
+  const details = readLoaderDetails(fakeLoaderContext([pendingEntry, activeEntry, failedEntry, noFiber, noId]));
+  assert.equal(details.ok, true);
+  assert.equal(details.reason, "");
+  // 没有 id 的条目被跳过（noId），其余 4 条保留。
+  assert.equal(details.entries.length, 4);
+  // 缺服务 = inject 里声明了、但 ctx.get(service) 返回 undefined。
+  assert.deepEqual(details.pending, [{ id: "ui-chat", name: "ui-chat", missing: ["demoService"] }]);
+  assert.deepEqual(details.failed, [{ id: "dsh-broken", name: "broken" }]);
+  assert.equal(details.active, 1);
+  const quiet = details.entries.filter(function (item) { return item.id === "dsh-quiet"; })[0];
+  assert.equal(quiet.state, "unknown");
+  assert.deepEqual(quiet.missing, []);
+
+  // 拿不到 loader → 降级（不影响文案判定）。
+  const unavailable = readLoaderDetails({});
+  assert.equal(unavailable.ok, false);
+  assert.equal(unavailable.reason, "unavailable");
+  assert.deepEqual(unavailable.pending, []);
+  assert.equal(unavailable.active, 0);
+
+  // entries() 抛错 → 只记 error，不抛出。
+  const broken = readLoaderDetails({
+    get: function () {
+      return { entries: function () { throw new Error("boom"); } };
+    }
+  });
+  assert.equal(broken.ok, false);
+  assert.match(broken.reason, /^error: .*boom/);
+});
+
+// ── 运行期热停用（H）───────────────────────────────────────────────────────
+
+function runtimeWithLoader(loader) {
+  return {
+    ctx: {
+      get: function (service) { return service === "loader" ? loader : undefined; }
+    }
+  };
+}
+
+test("tryHotDisable prefers loader.update and reports what was hot-disabled", async function () {
+  const calls = [];
+  const result = await tryHotDisable(runtimeWithLoader({
+    update: function (id, patch) { calls.push({ id: id, patch: patch }); }
+  }), ["dsh-meme", "dsh-tool"]);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.updated, ["dsh-meme", "dsh-tool"]);
+  assert.deepEqual(result.failed, []);
+  assert.deepEqual(calls, [
+    { id: "dsh-meme", patch: { disabled: true } },
+    { id: "dsh-tool", patch: { disabled: true } }
+  ]);
+});
+
+test("tryHotDisable falls back to entry.update when loader.update throws", async function () {
+  const resolved = [];
+  const result = await tryHotDisable(runtimeWithLoader({
+    update: function () { throw new Error("fiber is locked"); },
+    resolve: function (id) {
+      resolved.push(id);
+      return { update: function (patch) { assert.deepEqual(patch, { disabled: true }); } };
+    }
+  }), ["dsh-meme"]);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.updated, ["dsh-meme"]);
+  assert.deepEqual(result.failed, []);
+  assert.deepEqual(resolved, ["dsh-meme"]);
+});
+
+test("tryHotDisable records failed ids when every loader API is broken or missing", async function () {
+  // 两条路都抛错：记 failed，并把最后一次错误带出来。
+  const broken = await tryHotDisable(runtimeWithLoader({
+    update: function () { throw new Error("update failed"); },
+    resolve: function () { throw new Error("resolve failed"); }
+  }), ["dsh-meme"]);
+  assert.equal(broken.ok, false);
+  assert.deepEqual(broken.updated, []);
+  assert.equal(broken.failed.length, 1);
+  assert.equal(broken.failed[0].id, "dsh-meme");
+  assert.match(broken.failed[0].error, /resolve failed/);
+
+  // 完全没有 loader（旧宿主 / 只读）→ no-loader-api，不抛出。
+  const none = await tryHotDisable({ ctx: { get: function () { return undefined; } } }, ["dsh-meme"]);
+  assert.equal(none.ok, false);
+  assert.deepEqual(none.updated, []);
+  assert.deepEqual(none.failed, [{ id: "dsh-meme", error: "no-loader-api" }]);
+
+  // 连 ctx 都没有 → 同样只记 failed，绝不影响持久停用。
+  const noCtx = await tryHotDisable(undefined, ["dsh-meme"]);
+  assert.equal(noCtx.ok, false);
+  assert.equal(noCtx.failed.length, 1);
+});
+
+// ── 双通道注入（A）──────────────────────────────────────────────────────────
+
+test("injectChannelCount counts only channels that actually attached", function () {
+  assert.equal(injectChannelCount({ tapIndex: "ok", indexInject: "ok" }), 2);
+  assert.equal(injectChannelCount({ tapIndex: "ok", indexInject: "unsupported" }), 1);
+  assert.equal(injectChannelCount({ tapIndex: "failed: boom", indexInject: "ok" }), 1);
+  assert.equal(injectChannelCount({ tapIndex: "failed: boom", indexInject: "failed: boom" }), 0);
+  assert.equal(injectChannelCount({ indexInject: "ok" }), 1);
+  assert.equal(injectChannelCount({}), 0);
+  assert.equal(injectChannelCount(null), 0);
+  assert.equal(injectChannelCount(undefined), 0);
+});
+
+// ── 客户端文本约束：1.2.0 新文案 / 新路由 / 禁令一条不放松 ─────────────────
+
+test("rescue client 1.2.0 copy, routes and safety rails stay self-contained", async function () {
+  const text = await readFile(CLIENT_PATH, "utf8");
+
+  // 1.1.1 的禁令在 1.2.0 新增代码里同样成立（check.mjs 的同一套规则）。
+  assert.doesNotMatch(text, /^\s*import\s/m);
+  assert.doesNotMatch(text, /\brequire\s*\(/);
+  assert.doesNotMatch(text, /\bnew\s+Worker\b/);
+  assert.doesNotMatch(text, /\bWebAssembly\b/);
+  assert.doesNotMatch(text, /\bsetInterval\s*\(/);
+  assert.doesNotMatch(text, /\blocation\s*\.\s*reload\s*\(/);
+  assert.doesNotMatch(text, /刷新页面/);
+  assert.doesNotMatch(text, /\beval\s*\(/);
+  assert.doesNotMatch(text, /\bnew\s+Function\s*\(/);
+  assert.doesNotMatch(text, /[\w\)\]]\?\./);
+  assert.doesNotMatch(text, /\?\?/);
+  assert.doesNotMatch(text, /document\s*\.\s*cookie|localStorage|sessionStorage/);
+  assert.doesNotMatch(text, /fetch\s*\(\s*["']https?:/i);
+
+  // 1.2.0 的「更安全的」重启文案：热停用可用时只重新打开本页面。
+  assert.match(text, /重新打开本页面即可生效/);
+  assert.match(text, /hotDisabled/);
+  assert.match(text, /hotFailed/);
+
+  // 幂等哨兵与 boot ready 等待（增量 J）。
+  assert.match(text, /__DSHM_BOOT_RESCUE__/);
+  assert.match(text, /__DSH_BOOT_READY__/);
+  assert.match(text, /BOOT_READY_FALLBACK_MS/);
+
+  // 1.2.0 新路由全部出现（客户端只用这些相对路径，不发外部请求）。
+  const routes = [
+    "/dshm-boot-rescue/state",
+    "/dshm-boot-rescue/disable",
+    "/dshm-boot-rescue/restore",
+    "/dshm-boot-rescue/safe-mode",
+    "/dshm-boot-rescue/disable-bundle",
+    "/dshm-boot-rescue/restore-bundle",
+    "/dshm-boot-rescue/snapshot",
+    "/dshm-boot-rescue/rollback",
+    "/dshm-boot-rescue/quarantine/restore"
+  ];
+  for (const route of routes) {
+    assert.ok(text.indexOf(route) !== -1, "缺少路由 " + route);
+  }
+
+  // 1.2.0 新文案（面板区块 + 写操作结果 + 兜底胶囊）。
+  const needles = [
+    "安全模式",
+    "隔离残留",
+    "良好快照",
+    "救援台账",
+    "立即存快照",
+    "回滚到该快照",
+    "合并恢复",
+    "恢复 bundle 移除项",
+    "bundle 停用",
+    "已进入安全模式",
+    "快照已保存",
+    "已回滚到快照",
+    "已合并恢复",
+    "缺服务",
+    "CAPSULE_DELAY_MS",
+    "aria-label",
+    "dshm-boot-rescue-capsule"
+  ];
+  for (const needle of needles) {
+    assert.ok(text.indexOf(needle) !== -1, "缺少 " + needle);
+  }
+
+  // 只读 / 自检页必须禁用写操作，且不产生写请求。
+  assert.match(text, /data-dshm-boot-rescue-preview/);
+  assert.match(text, /isPreview/);
+  // 二次确认类按钮：安全模式 / 回滚 / 恢复都要求再次点击。
+  assert.match(text, /再次点击/);
+  // features 门槛：旧宿主没有 features 对象时不显示 1.2.0 按钮。
+  assert.match(text, /model\.features\.known/);
+});
+
+test("host registers every 1.2.0 route and keeps the rescue entry points", async function (t) {
+  // 静态兜底：宿主源码里这些路由/文件名必须存在（PC 上没有 node 时靠 check.mjs，
+  // 这里再在测试里钉一遍，防止有人删路由）。
+  const hostText = await readFile(new URL("../lib/index.js", import.meta.url), "utf8");
+  const needles = [
+    "/safe-mode",
+    "/disable-bundle",
+    "/restore-bundle",
+    "/snapshot",
+    "/rollback",
+    "/quarantine/restore",
+    "dshm-boot-rescue-ledger.json",
+    "dshm-boot-rescue-snapshots",
+    "webserver/index-inject",
+    "hotDisabled",
+    "REQUIRED_ENTRY_IDS",
+    "bundle-protected",
+    "quarantine-unmergeable"
+  ];
+  for (const needle of needles) {
+    assert.ok(hostText.indexOf(needle) !== -1, "lib/index.js 缺少 " + needle);
+  }
+  // 1.2.0 只做可逆移动：宿主源码不得出现「真删」类 API。
+  assert.doesNotMatch(hostText, /\brmSync\s*\(/);
+  assert.doesNotMatch(hostText, /\brmdir\s*\(/);
+});
+

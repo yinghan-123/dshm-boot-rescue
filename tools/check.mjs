@@ -207,7 +207,13 @@ section("lib/index.js", function () {
     [/export\s+(?:const|let|var)\s+inject\b/, "禁止 export inject（会进入 pending）"],
     [/export\s*\{[^}]*\binject\b/, "禁止把 inject 作为导出"],
     [/\/data\/storage/, "不得硬编码真机路径 /data/storage"],
-    [/\bhomedir\s*\(/, "数据目录只允许 DSH_HOME / DSHM_HOME，不要回退 homedir()"]
+    [/\bhomedir\s*\(/, "数据目录只允许 DSH_HOME / DSHM_HOME，不要回退 homedir()"],
+    // 1.2.0：救援只做可逆移动，绝不真删插件包，更不删 node_modules。
+    [/\brmSync\s*\(/, "禁止 rmSync 删除（救援只做可逆移动，不许真删插件包）"],
+    [/\brmdir\s*\(/, "禁止 rmdir（救援只做可逆移动，不许真删插件包）"],
+    [/(?:\brm|\brmSync|\brmdir)\s*\([^)\n]*\bnode_modules\b/, "禁止删除 node_modules"],
+    [/join\([^()\n]*["']node_modules["'][^()\n]*\)[^;\n]{0,160}?\b(?:rm|rmSync|rmdir)\s*\(/,
+      "禁止先拼接 node_modules 路径再删除"]
   ];
   for (const [pattern, label] of forbidden) {
     if (pattern.test(stripJsComments(text))) issues.push(label);
@@ -225,13 +231,41 @@ section("lib/index.js", function () {
     [/\/state\b/, "缺少 /state 路由"],
     [/\/disable\b/, "缺少 /disable 路由"],
     [/\/restore\b/, "缺少 /restore 路由"],
-    [/\/client\.js\b/, "缺少 /client.js 路由"]
+    [/\/client\.js\b/, "缺少 /client.js 路由"],
+    // 1.2.0 新路由与持久文件
+    [/\/safe-mode\b/, "缺少 /safe-mode 路由"],
+    [/\/disable-bundle\b/, "缺少 /disable-bundle 路由"],
+    [/\/restore-bundle\b/, "缺少 /restore-bundle 路由"],
+    [/\/snapshot\b/, "缺少 /snapshot 路由"],
+    [/\/rollback\b/, "缺少 /rollback 路由"],
+    [/\/quarantine\/restore\b/, "缺少 /quarantine/restore 路由"],
+    [/webserver\/index-inject/, "必须注册 webserver/index-inject 注入通道（双通道）"],
+    [/dshm-boot-rescue-ledger\.json/, "必须使用救援台账 dshm-boot-rescue-ledger.json"],
+    [/dshm-boot-rescue-snapshots/, "必须使用良好快照目录 dshm-boot-rescue-snapshots"],
+    [/dsh\.profile\.bundles/, "必须支持从 dsh.profile.bundles 移除（三级停用）"],
+    [/\b__DSH_BOOT_READY__\b|\bhotDisabled\b|\binjectChannelCount\b/, "缺少 1.2.0 增强接口"]
   ];
   for (const [pattern, label] of requiredPatterns) {
     if (!pattern.test(text)) issues.push(label);
   }
 
-  report("lib/index.js 静态约束（纯宿主 / 路由 / 诊断 / 无 inject）", issues);
+  // 1.2.0：这些纯函数必须保持「可导出」，测试与客户端契约都直接依赖它们。
+  const requiredExports = [
+    "readLedger",
+    "blockDigestOf",
+    "removeRowsByLedger",
+    "planBundleRemoval",
+    "mergeQuarantineRows",
+    "readLoaderDetails",
+    "tryHotDisable",
+    "injectChannelCount"
+  ];
+  for (const exported of requiredExports) {
+    const pattern = new RegExp("export\\s+(?:async\\s+)?function\\s+" + exported + "\\b");
+    if (!pattern.test(text)) issues.push("必须导出 " + exported + "（1.2.0 契约）");
+  }
+
+  report("lib/index.js 静态约束（纯宿主 / 路由 / 诊断 / 无 inject / 1.2.0 导出）", issues);
 });
 
 // ── 4. 救援脚本 lib/rescue-client.js ────────────────────────────────────────
@@ -288,7 +322,28 @@ section("lib/rescue-client.js", function () {
     ["web boot:", "必须识别 web boot 整体失败文案"],
     ["dshm-boot-rescue/state", "必须 fetch /dshm-boot-rescue/state"],
     ["data-dshm-boot-rescue-preview", "必须识别自检模式 body 属性"],
-    ["dbr-", "样式类必须统一 dbr- 前缀"]
+    ["dbr-", "样式类必须统一 dbr- 前缀"],
+    // 1.2.0 新增区块 / 按钮 / 文案 / 路由（与契约第 9 节对齐）。
+    ["__DSH_BOOT_READY__", "必须等宿主 __DSH_BOOT_READY__ 再扫 DOM"],
+    ["安全模式", "缺少「安全模式」按钮"],
+    ["隔离残留", "缺少「隔离残留」区块"],
+    ["良好快照", "缺少「良好快照」区块"],
+    ["救援台账", "缺少「救援台账」区块"],
+    ["立即存快照", "缺少「立即存快照」按钮"],
+    ["回滚到该快照", "缺少「回滚到该快照」按钮"],
+    ["合并恢复", "缺少「合并恢复」按钮"],
+    ["恢复 bundle 移除项", "缺少「恢复 bundle 移除项」按钮"],
+    ["bundle 停用", "缺少每行的 bundle 停用按钮"],
+    ["重新打开本页面即可生效", "缺少热停用的「重新打开本页面」提示"],
+    ["dshm-boot-rescue/safe-mode", "缺少 /safe-mode 调用"],
+    ["dshm-boot-rescue/disable-bundle", "缺少 /disable-bundle 调用"],
+    ["dshm-boot-rescue/restore-bundle", "缺少 /restore-bundle 调用"],
+    ["dshm-boot-rescue/snapshot", "缺少 /snapshot 调用"],
+    ["dshm-boot-rescue/rollback", "缺少 /rollback 调用"],
+    ["dshm-boot-rescue/quarantine/restore", "缺少 /quarantine/restore 调用"],
+    ["dshm-boot-rescue-capsule", "缺少兜底小胶囊（15s 最后入口）"],
+    ["aria-label", "胶囊 / 弹窗必须带 aria-label"],
+    ["hotDisabled", "必须消费热停用结果 hotDisabled"]
   ];
   const missing = hasAll(text, required);
   for (const item of missing) issues.push("缺少 " + item);
@@ -360,6 +415,35 @@ section("README.md", function () {
   report("README.md 必备说明", issues);
 });
 
+// ── 5.5 README.md 的 1.2.0 章节关键词 ──────────────────────────────────────
+section("README.md 1.2.0 章节", function () {
+  const text = read("README.md");
+  if (text === null) {
+    fail("README.md 1.2.0 章节", "文件不存在");
+    return;
+  }
+  const required = [
+    ["三级停用", "三级停用（rows → patch → bundles）"],
+    ["救援台账", "救援台账与指纹恢复"],
+    ["blockDigest", "台账指纹字段 blockDigest"],
+    ["良好快照", "良好快照与回滚"],
+    ["隔离", "隔离残留恢复"],
+    ["双通道", "双通道注入"],
+    ["loader", "loader 真实状态"],
+    ["required 黑名单", "required 黑名单"],
+    ["/safe-mode", "安全模式路由"],
+    ["/quarantine/restore", "隔离合并恢复路由"],
+    ["hotDisabled", "热停用响应字段"],
+    ["keep=5", "快照保留份数"],
+    ["preview?shape=", "自检页多形态"],
+    ["1.2.0", "版本标注"]
+  ];
+  const issues = hasAll(text, required).map(function (item) {
+    return "缺少「" + item + "」";
+  });
+  report("README.md 1.2.0 章节关键词（安全模式 / 台账 / 快照 / 隔离 / 双通道 / loader）", issues);
+});
+
 // ── 6. test/rescue.test.mjs ─────────────────────────────────────────────────
 section("test/rescue.test.mjs", function () {
   const text = read("test/rescue.test.mjs");
@@ -417,7 +501,28 @@ section("test/rescue.test.mjs", function () {
     }
   }
 
-  report("测试静态约束（node:test / 临时目录 / 导出名一致）", issues);
+  // 1.2.0：新增纯函数必须有对应的测试（缺一个就 FAIL，避免「实现了但没测」）。
+  const covered = [
+    "blockDigestOf",
+    "normalizeDisabledValue",
+    "removeRowsByLedger",
+    "readLedger",
+    "parseQuarantineBlocks",
+    "mergeQuarantineRows",
+    "bundlesOfManifest",
+    "isProtectedBundleName",
+    "planBundleRemoval",
+    "fiberStateName",
+    "readLoaderDetails",
+    "tryHotDisable",
+    "injectChannelCount",
+    "snapshotIdNow"
+  ];
+  for (const needed of covered) {
+    if (text.indexOf(needed) === -1) issues.push("缺少对 " + needed + " 的测试");
+  }
+
+  report("测试静态约束（node:test / 临时目录 / 导出名一致 / 1.2.0 覆盖）", issues);
 });
 
 // ── 输出 ───────────────────────────────────────────────────────────────────
