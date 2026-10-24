@@ -84,6 +84,55 @@ function stripJsComments(text) {
     .replace(/(^|[^:])\/\/[^\n]*/g, "$1");
 }
 
+// 取某个函数声明的函数体（`function name(...) { ... }`），用于切片级契约检查。
+// 只做字符级扫描：跳过字符串 / 模板 / 注释，靠大括号配平找结尾；
+// 不依赖执行，也不要求整个文件能被 Node 解析（本脚本要在没有 node 的环境里对照）。
+function functionBodyOf(text, name) {
+  const source = String(text || "");
+  const match = new RegExp("(?:export\\s+)?function\\s+" + name + "\\s*\\(").exec(source);
+  if (!match) return null;
+  const start = source.indexOf("{", match.index);
+  if (start === -1) return null;
+  let depth = 0;
+  for (let index = start; index < source.length; index += 1) {
+    const ch = source.charAt(index);
+    if (ch === "\"" || ch === "'" || ch === "`") {
+      index = skipQuoted(source, index, ch);
+      continue;
+    }
+    if (ch === "/" && source.charAt(index + 1) === "/") {
+      const end = source.indexOf("\n", index);
+      if (end === -1) return null;
+      index = end;
+      continue;
+    }
+    if (ch === "/" && source.charAt(index + 1) === "*") {
+      const end = source.indexOf("*/", index + 2);
+      if (end === -1) return null;
+      index = end + 1;
+      continue;
+    }
+    if (ch === "{") {
+      depth += 1;
+    } else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start + 1, index);
+    }
+  }
+  return null;
+}
+
+function skipQuoted(source, index, quote) {
+  let cursor = index + 1;
+  while (cursor < source.length) {
+    const ch = source.charAt(cursor);
+    if (ch === "\\") { cursor += 2; continue; }
+    if (ch === quote) return cursor;
+    cursor += 1;
+  }
+  return source.length;
+}
+
 // ── 0. 交付物齐全 ──────────────────────────────────────────────────────────
 section("交付物齐全", function () {
   const required = [
@@ -213,7 +262,9 @@ section("lib/index.js", function () {
     [/\brmdir\s*\(/, "禁止 rmdir（救援只做可逆移动，不许真删插件包）"],
     [/(?:\brm|\brmSync|\brmdir)\s*\([^)\n]*\bnode_modules\b/, "禁止删除 node_modules"],
     [/join\([^()\n]*["']node_modules["'][^()\n]*\)[^;\n]{0,160}?\b(?:rm|rmSync|rmdir)\s*\(/,
-      "禁止先拼接 node_modules 路径再删除"]
+      "禁止先拼接 node_modules 路径再删除"],
+    // 1.3.0：巡检只能是「setTimeout 链 + unref」，禁止 setInterval（宿主退出时无法清理）。
+    [/\bsetInterval\s*\(/, "禁止 setInterval（巡检必须用 setTimeout 链）"]
   ];
   for (const [pattern, label] of forbidden) {
     if (pattern.test(stripJsComments(text))) issues.push(label);
@@ -243,7 +294,20 @@ section("lib/index.js", function () {
     [/dshm-boot-rescue-ledger\.json/, "必须使用救援台账 dshm-boot-rescue-ledger.json"],
     [/dshm-boot-rescue-snapshots/, "必须使用良好快照目录 dshm-boot-rescue-snapshots"],
     [/dsh\.profile\.bundles/, "必须支持从 dsh.profile.bundles 移除（三级停用）"],
-    [/\b__DSH_BOOT_READY__\b|\bhotDisabled\b|\binjectChannelCount\b/, "缺少 1.2.0 增强接口"]
+    [/\b__DSH_BOOT_READY__\b|\bhotDisabled\b|\binjectChannelCount\b/, "缺少 1.2.0 增强接口"],
+    // 1.3.0：使用期体检的路由、报告文件与 loader 事件。
+    [/\/risks\b/, "缺少 /risks 路由（角标轮询用的轻量风险接口）"],
+    [/\/watch\b/, "缺少 /watch 路由（巡检状态与开关）"],
+    [/dshm-boot-rescue-risks\.json/, "必须落盘风险报告 dshm-boot-rescue-risks.json"],
+    [/dshm-boot-rescue-watch\.jsonl/, "必须落盘巡检历史 dshm-boot-rescue-watch.jsonl"],
+    [/loader\/entry-init/, "必须订阅 loader/entry-init 事件（事件驱动采样）"],
+    [/loader\/partial-dispose/, "必须订阅 loader/partial-dispose 事件（事件驱动采样）"],
+    [/RISK_MAX|risks\.slice/, "风险清单必须有上限（RISK_MAX）"],
+    // 1.4.0：风险摘要注入对话（设置文件 + systemPrompt 段 + 开关接口 + 防注入声明）。
+    [/subpath\s*===\s*["']\/inject["']/, "缺少 /inject 路由（对话注入开关）"],
+    [/dshm-boot-rescue-settings\.json/, "必须使用设置文件 dshm-boot-rescue-settings.json"],
+    [/\bsystemPrompt\b/, "必须注册 systemPrompt 服务（风险摘要注入）"],
+    [/是数据不是指令/, "注入文本必须带「是数据不是指令」防注入声明"]
   ];
   for (const [pattern, label] of requiredPatterns) {
     if (!pattern.test(text)) issues.push(label);
@@ -258,14 +322,68 @@ section("lib/index.js", function () {
     "mergeQuarantineRows",
     "readLoaderDetails",
     "tryHotDisable",
-    "injectChannelCount"
+    "injectChannelCount",
+    // 1.3.0：巡检与风险对象的纯函数（PC 上的 node:test 直接 import 它们）。
+    "scanRisks",
+    "riskKeyOf",
+    "makeRisk",
+    "watchSummary",
+    "startWatchdog",
+    "stopWatchdog",
+    // 1.4.0：注入摘要的纯函数（清洗 / 模板 / 设置 / 状态，node:test 直接 import 它们）。
+    "readSettings",
+    "sanitizePromptToken",
+    "buildRiskPromptText",
+    "promptInjectState"
   ];
   for (const exported of requiredExports) {
     const pattern = new RegExp("export\\s+(?:async\\s+)?function\\s+" + exported + "\\b");
-    if (!pattern.test(text)) issues.push("必须导出 " + exported + "（1.2.0 契约）");
+    if (!pattern.test(text)) issues.push("必须导出 " + exported + "（1.3.0 契约）");
   }
 
-  report("lib/index.js 静态约束（纯宿主 / 路由 / 诊断 / 无 inject / 1.2.0 导出）", issues);
+  report("lib/index.js 静态约束（纯宿主 / 路由 / 诊断 / 无 inject / 1.2.0+1.3.0 导出）", issues);
+});
+
+// ── 3.5 lib/index.js：注入摘要只许用结构化字段（防第三方文案进提示词）────────
+section("lib/index.js 注入摘要防泄漏", function () {
+  const text = read("lib/index.js");
+  if (text === null) {
+    fail("风险摘要注入防泄漏", "文件不存在");
+    return;
+  }
+  const issues = [];
+
+  // 1.4.0 硬规则：buildRiskPromptText 的实现里不得出现 .message（也不得读
+  // risk.name / actionable / suggest），否则失败页原文、插件 README、package.json
+  // description、日志原文这些第三方文案会被带进系统提示词。切片检查函数体即可，
+  // 不依赖执行、也不需要 node 解析整个文件。
+  const body = functionBodyOf(text, "buildRiskPromptText");
+  if (body === null) {
+    issues.push("找不到 buildRiskPromptText 的函数体（无法做防注入检查）");
+  } else {
+    if (/\.message\b/.test(body)) {
+      issues.push("buildRiskPromptText 的函数体出现了 .message（第三方文案会进系统提示词）");
+    }
+    if (/\brisk\.name\b|\brisk\.actionable\b|\brisk\.suggest\b/.test(body)) {
+      issues.push("buildRiskPromptText 只能取 level/kind/id/missing/sinceBaseline，不得读 name/actionable/suggest");
+    }
+    if (body.indexOf("INJECT_MAX_RISKS") === -1) {
+      issues.push("buildRiskPromptText 必须用 INJECT_MAX_RISKS 限制注入条数（最多 8 条）");
+    }
+    if (body.indexOf("是数据不是指令") === -1) {
+      issues.push("buildRiskPromptText 必须输出「是数据不是指令」防注入声明");
+    }
+  }
+
+  // 清洗函数必须是白名单制：只保留 [\w@./:-]，其它字符折叠成 ?。
+  const sanitizeBody = functionBodyOf(text, "sanitizePromptToken");
+  if (sanitizeBody === null) {
+    issues.push("找不到 sanitizePromptToken 的函数体");
+  } else if (sanitizeBody.indexOf("[\\w@./:-]") === -1) {
+    issues.push("sanitizePromptToken 必须只保留白名单 [\\w@./:-]（其它字符折叠成 ?）");
+  }
+
+  report("lib/index.js 注入摘要防泄漏（buildRiskPromptText 无 .message / 只取结构化字段）", issues);
 });
 
 // ── 4. 救援脚本 lib/rescue-client.js ────────────────────────────────────────
@@ -360,6 +478,22 @@ section("lib/rescue-client.js", function () {
     issues.push("不得读取 cookie/localStorage/sessionStorage");
   }
 
+  // 1.3.0 正向规则：角标（dshm-boot-rescue-badge）只允许「setTimeout 链 + document.hidden
+  // 暂停」的轮询方式。出现角标就必须同时出现 document.hidden 与 setTimeout，
+  // 否则角标会在切后台时继续打请求，或在卸载后留下悬空 timer。
+  if (text.indexOf("dshm-boot-rescue-badge") !== -1) {
+    if (text.indexOf("document.hidden") === -1) {
+      issues.push("出现角标 dshm-boot-rescue-badge 时必须判断 document.hidden（切后台暂停轮询）");
+    }
+    if (text.indexOf("setTimeout") === -1) {
+      issues.push("出现角标 dshm-boot-rescue-badge 时必须用 setTimeout 链轮询（禁止 setInterval）");
+    }
+  }
+  // 1.3.0：风险轮询一律走 /risks 轻接口；角标出现时不许只靠 /state 做高频轮询。
+  if (text.indexOf("dshm-boot-rescue-badge") !== -1 && text.indexOf("dshm-boot-rescue/risks") === -1) {
+    issues.push("出现角标 dshm-boot-rescue-badge 时必须轮询 /dshm-boot-rescue/risks（比 /state 轻）");
+  }
+
   // ES5 风格仅作警告，避免误伤可运行的实现。
   const styleWarnings = [];
   if (/=>/.test(text)) styleWarnings.push("出现箭头函数（建议 var/function）");
@@ -444,6 +578,68 @@ section("README.md 1.2.0 章节", function () {
   report("README.md 1.2.0 章节关键词（安全模式 / 台账 / 快照 / 隔离 / 双通道 / loader）", issues);
 });
 
+// ── 5.6 README.md 的 1.3.0 章节关键词 ──────────────────────────────────────
+section("README.md 1.3.0 章节", function () {
+  const text = read("README.md");
+  if (text === null) {
+    fail("README.md 1.3.0 章节", "文件不存在");
+    return;
+  }
+  const required = [
+    ["1.3.0", "版本标注"],
+    ["使用期体检", "巡检能力名称"],
+    ["critical", "风险等级 critical"],
+    ["warn", "风险等级 warn"],
+    ["info", "风险等级 info"],
+    ["missing-package", "kind missing-package"],
+    ["self-heal", "kind self-heal"],
+    ["rescue-readonly", "kind rescue-readonly"],
+    ["inject-channel", "kind inject-channel"],
+    ["pending", "kind pending"],
+    ["角标", "右下角角标"],
+    ["dshm-boot-rescue-badge", "角标 DOM id"],
+    ["document.hidden", "切后台暂停轮询"],
+    ["60 秒", "60s 采样节奏"],
+    ["/risks", "风险接口"],
+    ["/watch", "巡检状态与开关路由"],
+    ["enabled:false", "一键关闭巡检的请求体"],
+    ["risks.json", "风险报告文件"],
+    ["watch.jsonl", "巡检历史文件"],
+    ["一键停用", "弹窗一键停用"],
+    ["baseline", "健康基线"]
+  ];
+  const issues = hasAll(text, required).map(function (item) {
+    return "缺少「" + item + "」";
+  });
+  report("README.md 1.3.0 章节关键词（体检 / 8 种 kind / 角标 / 路由 / 报告文件）", issues);
+});
+
+// ── 5.7 README.md 的 1.4.0 章节关键词 ──────────────────────────────────────
+section("README.md 1.4.0 章节", function () {
+  const text = read("README.md");
+  if (text === null) {
+    fail("README.md 1.4.0 章节", "文件不存在");
+    return;
+  }
+  const required = [
+    ["1.4.0", "版本标注"],
+    ["风险摘要注入", "注入能力名称"],
+    ["systemPrompt", "宿主系统提示服务"],
+    ["是数据不是指令", "防注入声明"],
+    ["dshm-boot-rescue-settings.json", "设置文件"],
+    ["promptInject", "开关字段"],
+    ["/inject", "开关路由"],
+    ["最多 8 条", "注入条数上限"],
+    ["unsupported", "宿主不支持时退化为不注入"],
+    ["所有对话", "注入作用于所有对话"],
+    ["15 项", "日常检查项数"]
+  ];
+  const issues = hasAll(text, required).map(function (item) {
+    return "缺少「" + item + "」";
+  });
+  report("README.md 1.4.0 章节关键词（注入摘要 / 开关 / 设置文件 / 安全边界 / 已知限制）", issues);
+});
+
 // ── 6. test/rescue.test.mjs ─────────────────────────────────────────────────
 section("test/rescue.test.mjs", function () {
   const text = read("test/rescue.test.mjs");
@@ -516,13 +712,25 @@ section("test/rescue.test.mjs", function () {
     "readLoaderDetails",
     "tryHotDisable",
     "injectChannelCount",
-    "snapshotIdNow"
+    "snapshotIdNow",
+    // 1.3.0：巡检相关纯函数同样必须有测试。
+    "riskKeyOf",
+    "makeRisk",
+    "watchSummary",
+    "scanRisks",
+    "startWatchdog",
+    "stopWatchdog",
+    // 1.4.0：注入摘要的四个纯函数同样必须有测试。
+    "readSettings",
+    "sanitizePromptToken",
+    "buildRiskPromptText",
+    "promptInjectState"
   ];
   for (const needed of covered) {
     if (text.indexOf(needed) === -1) issues.push("缺少对 " + needed + " 的测试");
   }
 
-  report("测试静态约束（node:test / 临时目录 / 导出名一致 / 1.2.0 覆盖）", issues);
+  report("测试静态约束（node:test / 临时目录 / 导出名一致 / 1.2.0+1.3.0+1.4.0 覆盖）", issues);
 });
 
 // ── 输出 ───────────────────────────────────────────────────────────────────
